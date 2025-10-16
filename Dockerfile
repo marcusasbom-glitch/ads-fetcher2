@@ -1,4 +1,5 @@
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+# Basimage med Playwright
+FROM mcr.microsoft.com/playwright/python:1.47.0-jammy
 
 WORKDIR /app
 COPY . /app
@@ -6,4 +7,5 @@ COPY . /app
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps
 
-CMD ["python", "ads_capture_and_extract.py"]
+EXPOSE 8000
+CMD ["uvicorn", "webapi:app", "--host", "0.0.0.0", "--port", "8000"]
