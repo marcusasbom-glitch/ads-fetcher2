@@ -376,3 +376,83 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     wb.save(excel_path)
     print(f"✅ Excel med inbäddade bilder sparad som: {excel_path}")
     return True
+
+# --- Nya imports ---
+from pathlib import Path
+import cv2
+import numpy as np
+import pytesseract
+from pytesseract import Output
+from PIL import Image
+
+# Språk: engelska + svenska. Anpassa efter behov (ex: "eng+deu").
+TESS_LANG = "eng+swe"
+
+def ocr_headlines(image_path: Path) -> tuple[str | None, str | None]:
+    """
+    Kör OCR på annonsbilden och försöker plocka ut H1/H2 med heuristik.
+    Idé:
+      - Kör pytesseract i TSV-läge för att få bounding boxes per ord.
+      - Gruppér ord per rad (line_num) och räkna genomsnittlig texthöjd.
+      - Rangordna rader efter (stor text först), med bias för rader nära bildens topp.
+      - Returnera de två bästa raderna som (H1, H2).
+    """
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return None, None
+
+        # Pre-processing som ofta höjer OCR-kvalitet:
+        # 1) konvertera till grått
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 2) mild upscaling (hjälper små typsnitt)
+        scale = 1.5
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # 3) light denoise + binarisering
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+        # Kör pytesseract i TSV mode (ger boxar/ord/radnummer)
+        data = pytesseract.image_to_data(
+            bw,
+            lang=TESS_LANG,
+            output_type=Output.DICT,
+            config="--oem 3 --psm 6"   # “Assume a single uniform block of text”
+        )
+
+        n = len(data["text"])
+        if n == 0:
+            return None, None
+
+        # Bygg upp rader: { (block_num, par_num, line_num): [ord-obj] }
+        lines: dict[tuple[int, int, int], list[dict]] = {}
+        H, W = bw.shape[:2]
+
+        for i in range(n):
+            txt = (data["text"][i] or "").strip()
+            conf = int(data.get("conf", ["-1"])[i])
+            if not txt or conf < 30:  # hoppa över skräp
+                continue
+
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            entry = {
+                "text": txt,
+                "left": data["left"][i],
+                "top": data["top"][i],
+                "width": data["width"][i],
+                "height": data["height"][i],
+                "conf": conf,
+            }
+            lines.setdefault(key, []).append(entry)
+
+        if not lines:
+            return None, None
+
+        # Sammanställ rader med metrik: fulltext, medel-höjd, y-position
+        rows = []
+        for key, words in lines.items():
+            words_sorted = sorted(words, key=lambda w: w["left"])
+            full_text = " ".join(w["text"] for w in words_sorted).strip()
+            if len(full_text)_
+
+
