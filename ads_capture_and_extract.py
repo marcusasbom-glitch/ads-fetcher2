@@ -453,6 +453,7 @@ def ocr_headlines(image_path: Path) -> tuple[str | None, str | None]:
         for key, words in lines.items():
             words_sorted = sorted(words, key=lambda w: w["left"])
             full_text = " ".join(w["text"] for w in words_sorted).strip()
-            if len(full_text)_
+            if len(full_text)
+
 
 
