@@ -108,47 +108,69 @@ async def capture_network(ar_input: str, run_dir: Path) -> None:
 # ============================================================
 # UPPDATERAD process_candidates_and_save – skriver H1/H2 till Excel
 # ============================================================
-def process_candidates_and_save(run_dir: Path) -> bool:
-    """
-    Läser insamlade annonser från run_dir, kör OCR för H1/H2 och skriver ads_extracted.xlsx.
-    Förväntar sig en JSON-lista med annonser i run_dir/ads_collected.json (eller justera enligt din struktur).
-    Varje annons bör ha minst: ar_id, source, url, image_path (lokal filväg till bild).
-    """
-    try:
-        # 1) Läs in dina insamlade annonser (anpassa filnamn om du använder ett annat)
-        ads_json = run_dir / "ads_collected.json"
-        if not ads_json.exists():
-            # Om du har ett annat format/filnamn – ändra här så det matchar din capture-kod.
-            return False
+# ads_capture_and_extract.py (UTDRAG – byt bara denna funktion)
+from pathlib import Path
+import os, json
+import pandas as pd
 
-        ads = json.loads(ads_json.read_text(encoding="utf-8"))
+# importera OCR-funktionen om du inte redan gjort det högst upp i filen:
+from ocr_utils import ocr_h1_h2_from_image
 
-        rows = []
+def _scan_images(root: Path):
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            yield p
+
+def process_candidates_and_save(run_dir: Path, ar_input: str = None) -> bool:
+    """
+    Bearbetar annonser och skriver Excel.
+    1) Försök läsa run_dir/ads_collected.json (lista med dicts).
+       Förväntade keys: ar_id, source, url, image_path
+    2) Om filen saknas: fallback → scanna alla bilder i run_dir och OCR:a dem.
+    """
+    rows = []
+
+    ads_json = run_dir / "ads_collected.json"
+    if ads_json.exists():
+        try:
+            ads = json.loads(ads_json.read_text(encoding="utf-8"))
+        except Exception:
+            ads = []
         for ad in ads:
-            # Anpassa fältnamn om dina keys skiljer sig
             img_path = ad.get("image_path")
             h1 = h2 = None
             if img_path and os.path.exists(img_path):
                 h1, h2 = ocr_h1_h2_from_image(img_path)
 
-            row = {
-                "AR-ID": ad.get("ar_id"),
+            rows.append({
+                "AR-ID": ad.get("ar_id") or ar_input,
                 "Källa": ad.get("source"),
                 "Annons-URL": ad.get("url"),
                 "Bildfil": os.path.basename(img_path) if img_path else "",
                 "H1 (OCR)": h1,
                 "H2 (OCR)": h2,
-            }
-            rows.append(row)
+            })
 
-        # 2) Skriv Excel
-        out = run_dir / "ads_extracted.xlsx"
-        df = pd.DataFrame(rows)
-        with pd.ExcelWriter(out, engine="openpyxl") as xw:
-            df.to_excel(xw, index=False, sheet_name="Ads")
+    # Fallback om inga rader hittades
+    if not rows:
+        for p in _scan_images(run_dir):
+            h1, h2 = ocr_h1_h2_from_image(str(p))
+            rows.append({
+                "AR-ID": ar_input,
+                "Källa": None,
+                "Annons-URL": None,
+                "Bildfil": p.name,
+                "H1 (OCR)": h1,
+                "H2 (OCR)": h2,
+            })
 
-        return True
-    except Exception as e:
-        # Logga till stdout – Render visar i loggar
-        print("Fel i process_candidates_and_save:", e)
-        return False
+    if not rows:
+        return False  # fortfarande inget att skriva
+
+    out = run_dir / "ads_extracted.xlsx"
+    df = pd.DataFrame(rows)
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="Ads")
+    return True
+
