@@ -4,19 +4,105 @@
 # Den här filen lägger till OCR (H1/H2) och uppdaterar Excel-exporten.
 # ============================================================
 
-from __future__ import annotations
+# --- ersätt HELA capture_network med denna version ---
+import asyncio, mimetypes
 from pathlib import Path
-import os
-import json
-import pandas as pd
+from typing import List, Dict
 
-# --- OCR imports ---
-import pytesseract
-from pytesseract import Output
-from PIL import Image
-import cv2
-import numpy as np
-from collections import defaultdict
+from playwright.async_api import async_playwright
+
+async def capture_network(ar_input: str, run_dir: Path) -> None:
+    """
+    Minimal generisk capture:
+      - Navigerar till ar_input (om det ser ut som en URL), annars försöker bygga FB Ads Library-länk funktionsmässigt.
+      - Sparar ALLA image/*-resurser från nätverket till run_dir/images/.
+      - Om inga bilder hittas: tar en fullständig screenshot som fallback.
+      - Skriver run_dir/ads_collected.json (lista med dicts).
+    """
+    images: List[Dict] = []
+    img_dir = run_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # Hjälpare: spara ett nätverkssvar som bild
+    async def _save_image_response(resp):
+        try:
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if not ct.startswith("image/"):
+                return
+            body = await resp.body()
+            if not body:
+                return
+            ext = mimetypes.guess_extension(ct) or ".bin"
+            name = f"img_{len(images)+1:03d}{ext}"
+            path = img_dir / name
+            path.write_bytes(body)
+            images.append({
+                "ar_id": ar_input,
+                "source": "network",
+                "url": resp.url,
+                "image_path": str(path),
+                "content_type": ct,
+            })
+        except Exception:
+            # svälj – network-flöde får aldrig krascha hela jobbet
+            return
+
+    # Bestäm navigations-URL
+    def _to_url(s: str) -> str:
+        s = (s or "").strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            return s
+        # Enkel heuristic: om det liknar AR-id, försök Ads Library (du kan byta till din exakta mall)
+        # OBS: detta är bara en safe placeholder. Om du redan bygger url i din originalkod – behåll din version.
+        return f"https://www.facebook.com/ads/library/?id={s}"
+
+    url = _to_url(ar_input)
+
+    # Playwright-körning
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        # Fånga alla responses och spara image/*
+        page.on("response", lambda resp: asyncio.create_task(_save_image_response(resp)))
+
+        # Nav + enkel väntan
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            # även om navigation bråkar vill vi ändå försöka fånga ev. redan loggade responses
+            pass
+
+        # Låt sidan ladda en stund (annars missar vi bilder som streamas in)
+        # Justera om du vill: kortare vid snabba sidor, längre om Ads-sidan är seg
+        await page.wait_for_timeout(6000)
+
+        # Fallback om inga nätverksbilder fångats → ta en screenshot
+        if not images:
+            shot = img_dir / "screenshot.png"
+            try:
+                await page.screenshot(path=str(shot), full_page=True)
+                images.append({
+                    "ar_id": ar_input,
+                    "source": "screenshot",
+                    "url": page.url,
+                    "image_path": str(shot),
+                    "content_type": "image/png",
+                })
+            except Exception:
+                # som sista utväg – lämna listan tom (process-steget skapar tomt Excel ändå)
+                pass
+
+        await context.close()
+        await browser.close()
+
+    # Skriv JSON (även om tom lista – process-steget hanterar detta och skriver tom Excel)
+    (run_dir / "ads_collected.json").write_text(
+        json.dumps(images, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
 
 
 # ============================================================
@@ -190,4 +276,5 @@ def process_candidates_and_save(run_dir: Path, ar_input: str = None) -> bool:
     (run_dir / "processing_debug.json").write_text(json.dumps(debug_info, ensure_ascii=False), encoding="utf-8")
 
     return True
+
 
