@@ -1,108 +1,240 @@
-# ----- OCR: extrahera H1/H2 ur en annonsbild -----
-from PIL import Image
-import numpy as np
-import easyocr
+import asyncio
+import json
+import re
 from pathlib import Path
+from typing import List, Dict, Any, Optional
 
-# Skapa en reader en gång (sv + en, CPU)
-_OCR_READER = easyocr.Reader(['sv', 'en'], gpu=False)
+import httpx
+from bs4 import BeautifulSoup
+from PIL import Image
+from io import BytesIO
 
-def extract_headlines_from_image(img_path: str | Path) -> tuple[str, str]:
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
+
+from playwright.async_api import async_playwright
+
+
+# ---------------------------------------------------------
+# Hjälpfunktioner
+# ---------------------------------------------------------
+
+def normalize_url(ar_input: str) -> str:
     """
-    Läser text ur en bild och heuristiskt väljer två 'största' rader som H1/H2.
-    Returnerar (h1, h2).
+    Om ar_input ser ut som ett AR-ID (t.ex. 'AR181828...') bygg en
+    Annonsöversikt-URL. Annars antar vi att ar_input är en full URL.
     """
-    img_path = Path(img_path)
-    if not img_path.exists():
-        return ("", "")
+    ar_input = (ar_input or "").strip()
+    if re.match(r"^AR[0-9]+", ar_input, flags=re.I):
+        # Bygg URL liknande den vi såg i loggarna.
+        # Anpassa origin/region/preset/platform om du vill.
+        return (
+            f"https://adstransparency.google.com/advertiser/{ar_input}"
+            f"?origin=ata&region=SE&preset-date=Last+30+days&platform=SEARCH"
+        )
+    # Annars tolkar vi det som en full URL
+    return ar_input
 
-    im = Image.open(img_path).convert("RGB")
-    w, h = im.size
 
-    # easyocr -> listor av: [bbox, text, conf]
-    results = _OCR_READER.readtext(np.array(im), detail=1, paragraph=False)
+async def scroll_page(page, steps: int = 10, delay_ms: int = 500):
+    """
+    En enkel auto-scroll för att ladda fler kort. Kan justeras.
+    """
+    for _ in range(steps):
+        await page.mouse.wheel(0, 1500)
+        await page.wait_for_timeout(delay_ms)
 
-    words = []
-    for bbox, text, conf in results:
-        text = (text or "").strip()
-        if not text:
-            continue
 
-        # bbox är 4 punkter [[x1,y1],[x2,y2]...]
-        xs = [p[0] for p in bbox]
-        ys = [p[1] for p in bbox]
-        x = min(xs)
-        y = min(ys)
-        ww = max(xs) - x
-        hh = max(ys) - y
-        if ww <= 0 or hh <= 0:
-            continue
+# ---------------------------------------------------------
+# Playwright / DOM-extraktion
+# ---------------------------------------------------------
 
-        # Grov "storleks-score" för raden: area relativt bilden
-        area = ww * hh
-        font_score = area / max(1.0, (w * h))
+extract_ads_js = """
+() => {
+  // Försök hitta kort i listan. Selektorerna kan variera.
+  // Nedan en generisk strategi: leta element som ser ut som "annonskort"
+  // och extrahera headline, body/description och ev. bild <img>.
+  const items = [];
+  // Exempel: kort kan ha role="listitem" eller speciella klasser. 
+  // För att vara robust: plocka alla card-liknande containers och försök hitta fält inuti.
+  const cards = document.querySelectorAll('[role="listitem"], article, div[data-ad-card], .ad-card, .card');
 
-        words.append({
-            "x": float(x),
-            "y": float(y),
-            "w": float(ww),
-            "h": float(hh),
-            "text": text,
-            "score": float(font_score),
-        })
+  cards.forEach(card => {
+    const textBlocks = card.querySelectorAll('h1, h2, h3, [role="heading"], .headline, .title');
+    let headline = '';
+    if (textBlocks && textBlocks.length > 0) {
+      headline = textBlocks[0].textContent?.trim() ?? '';
+    }
 
-    # Inget att jobba med
-    if not words:
-        return ("", "")
+    // Leta efter brödtext
+    let body = '';
+    const bodyCand = card.querySelectorAll('p, .description, .body, [data-body]');
+    if (bodyCand && bodyCand.length > 0) {
+      // hämta den första men slå ihop lite text om möjligt
+      body = Array.from(bodyCand).map(el => el.textContent?.trim() ?? '').filter(Boolean).join(' / ');
+    }
 
-    # Sortera ord ungefär uppifrån-ned, vänster->höger
-    words.sort(key=lambda d: (d["y"], d["x"]))
+    // Leta efter bild
+    let imgUrl = '';
+    const img = card.querySelector('img');
+    if (img && img.src) {
+      imgUrl = img.src;
+    }
+    if (!headline && !body && !imgUrl) return;
 
-    # Gruppéra ord till rader baserat på liknande y-led (höjd)
-    lines = []
-    used = [False] * len(words)
+    items.push({
+      headline,
+      body,
+      image_url: imgUrl
+    });
+  });
 
-    for i, base in enumerate(words):
-        if used[i]:
-            continue
-        line = [base]
-        used[i] = True
+  return items;
+}
+"""
 
-        # Tillåt variation i y upp till ~60% av ordhöjd
-        y_tol = base["h"] * 0.6
 
-        for j in range(i + 1, len(words)):
-            if used[j]:
-                continue
-            cand = words[j]
-            if abs(cand["y"] - base["y"]) <= max(y_tol, cand["h"] * 0.6):
-                line.append(cand)
-                used[j] = True
+async def capture_network(ar_input: str, run_dir: Path) -> None:
+    """
+    - Bygger rätt URL från AR-ID eller använder given URL
+    - Öppnar sidan, väntar in, scrollar, extraherar annonskandidater
+    - Sparar 'ads_candidates.json' i run_dir
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    url = normalize_url(ar_input)
 
-        # Sätt ihop radens text
-        line.sort(key=lambda d: d["x"])
-        full_text = " ".join(wd["text"] for wd in line).strip()
-        if len(full_text) < 2:
-            continue
+    candidates_path = run_dir / "ads_candidates.json"
+    html_path = run_dir / "page.html"
 
-        avg_h = float(sum(wd["h"] for wd in line) / max(1, len(line)))
-        avg_score = float(sum(wd["score"] for wd in line) / max(1, len(line)))
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 900}
+        )
+        page = await context.new_page()
 
-        lines.append({
-            "text": full_text,
-            "avg_h": avg_h,
-            "score": avg_score,
-        })
+        # Gå till sidan
+        await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        # Vänta in ytterligare lite rendering
+        await page.wait_for_timeout(2000)
 
-    if not lines:
-        return ("", "")
+        # Prova auto-scroll för att ladda fler kort
+        await scroll_page(page, steps=12, delay_ms=500)
 
-    # Heuristisk rankning: främst stor höjd + "stor" area (score)
-    for ln in lines:
-        ln["rank"] = ln["avg_h"] * 1.0 + ln["score"] * 3.0 + (len(ln["text"]) / 500.0)
+        # Försök extrahera via JS
+        items = await page.evaluate(extract_ads_js)
 
-    lines.sort(key=lambda l: l["rank"], reverse=True)
+        # Som fallback: spara HTML så vi kan felsöka vid behov
+        html = await page.content()
+        html_path.write_text(html, encoding="utf-8")
 
-    h1 = lines[0]["text"] if len(lines) > 0 else ""
-    h2 = lines[1]["text"] if len(lines) > 1 else ""
-    return (h1, h2)
+        await context.close()
+        await browser.close()
+
+    # Spara kandidater
+    with candidates_path.open("w", encoding="utf-8") as f:
+        json.dump({"url": url, "items": items}, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------
+# Bearbeta kandidater -> Excel med inbäddade bilder
+# ---------------------------------------------------------
+
+def _download_image_bytes(url: str, timeout: float = 20.0) -> Optional[bytes]:
+    """
+    Hämta ner en bild som bytes, eller returnera None om det misslyckas.
+    """
+    if not url:
+        return None
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            r = client.get(url)
+            if r.status_code == 200 and r.content:
+                return r.content
+    except Exception:
+        return None
+    return None
+
+
+def _fit_image_for_xlsx(image_bytes: bytes, max_w: int = 420, max_h: int = 280) -> Optional[BytesIO]:
+    """
+    Skala om bilden proportionellt för att passa snyggt i cellen.
+    Returnerar BytesIO (PNG) att bädda in i Excel.
+    """
+    try:
+        im = Image.open(BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((max_w, max_h), Image.LANCZOS)
+        out = BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        out.seek(0)
+        return out
+    except Exception:
+        return None
+
+
+def process_candidates_and_save(run_dir: Path) -> bool:
+    """
+    Läser 'ads_candidates.json' och skapar 'ads_extracted.xlsx'.
+    Embeddar nedladdade bilder i en kolumn.
+    Returnerar True om filen skapades.
+    """
+    candidates_path = run_dir / "ads_candidates.json"
+    if not candidates_path.exists():
+        return False
+
+    data = json.loads(candidates_path.read_text(encoding="utf-8"))
+    items: List[Dict[str, Any]] = data.get("items", [])
+
+    # Rensa tomma items
+    cleaned = []
+    for it in items:
+        head = (it.get("headline") or "").strip()
+        body = (it.get("body") or "").strip()
+        img = (it.get("image_url") or "").strip()
+        if head or body or img:
+            cleaned.append({"headline": head, "body": body, "image_url": img})
+
+    if not cleaned:
+        # Ingen data – skapa ändå en enkel Excel som markör
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Ads"
+        ws.append(["Headline", "Body", "Image"])
+        out = run_dir / "ads_extracted.xlsx"
+        wb.save(out)
+        return True
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Ads"
+    ws.append(["Headline", "Body", "Image"])
+
+    # Formatera kolumnbredder
+    ws.column_dimensions[get_column_letter(1)].width = 50  # Headline
+    ws.column_dimensions[get_column_letter(2)].width = 70  # Body
+    ws.column_dimensions[get_column_letter(3)].width = 40  # Image
+
+    row = 2
+    for it in cleaned:
+        ws.cell(row=row, column=1, value=it.get("headline") or "")
+        ws.cell(row=row, column=2, value=it.get("body") or "")
+
+        img_url = it.get("image_url") or ""
+        if img_url:
+            img_bytes = _download_image_bytes(img_url)
+            if img_bytes:
+                fitted = _fit_image_for_xlsx(img_bytes)
+                if fitted:
+                    xlimg = XLImage(fitted)
+                    # Placera bilden i kolumn C
+                    cell_addr = f"{get_column_letter(3)}{row}"
+                    ws.add_image(xlimg, cell_addr)
+                    # Höj raden lite för att få plats
+                    ws.row_dimensions[row].height = 220
+
+        row += 1
+
+    out = run_dir / "ads_extracted.xlsx"
+    wb.save(out)
+    return out.exists()
