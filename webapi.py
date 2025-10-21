@@ -1,30 +1,24 @@
 # webapi.py
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 from pathlib import Path
-import os, json, uuid, asyncio
+import os, json, uuid, asyncio, traceback, time
 
-# === Din pipeline ===
-# capture_network: async – styr Playwright och fångar data till run_dir
-# process_candidates_and_save: sync – bearbetar och skriver ads_extracted.xlsx
 from ads_capture_and_extract import capture_network, process_candidates_and_save
 
-# -------------------------------------------------------------------
-# App & CORS
-# -------------------------------------------------------------------
 app = FastAPI()
 
-# Öppen CORS (enkelt för test). Vill du låsa ner: byt allow_origins till en lista med dina domäner.
+# ----- CORS -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # ex: ["https://din-domän.se", "https://www.din-domän.se"]
-    allow_methods=["*"],        # GET, POST, OPTIONS m.fl.
-    allow_headers=["*"],        # Content-Type m.m.
-    allow_credentials=False,    # håll False när du använder "*"
+    allow_origins=["*"],        # lås gärna ner till dina domäner när allt funkar
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
 )
 
-# Fångar ALLA OPTIONS (preflight) och svarar 204 så att proxies/gateways inte ger 405.
+# OPTIONS catch-all så preflight aldrig blir 405
 @app.options("/{rest_of_path:path}")
 def preflight_catchall(rest_of_path: str, request: Request):
     origin = request.headers.get("origin", "*")
@@ -38,68 +32,122 @@ def preflight_catchall(rest_of_path: str, request: Request):
     }
     return Response(status_code=204, headers=headers)
 
-# -------------------------------------------------------------------
-# Konfiguration
-# -------------------------------------------------------------------
-RUNS_DIR = Path(os.getenv("RUNS_DIR", "/tmp/runs"))
-RUNS_DIR.mkdir(parents=True, exist_ok=True)
+# ----- Root/health -----
+@app.get("/")
+def root():
+    return JSONResponse({"ok": True, "service": "ads-fetcher",
+                         "endpoints": ["/ping", "/run", "/status/{job_id}", "/download/{job_id}", "/logs/{job_id}"]})
 
-def write_status(job_dir: Path, payload: dict):
-    (job_dir / "status.json").write_text(
-        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-    )
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
-def read_status(job_dir: Path):
-    p = job_dir / "status.json"
-    if not p.exists():
-        return None
-    return json.loads(p.read_text(encoding="utf-8"))
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
-# -------------------------------------------------------------------
-# Hjälp-endpoints
-# -------------------------------------------------------------------
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
-# -------------------------------------------------------------------
-# Jobb-logik
-# -------------------------------------------------------------------
-async def do_job(job_id: str, ar_input: str):
-    """Kör hela pipeline för ett job_id."""
-    job_dir = RUNS_DIR / job_id
-    try:
-        write_status(job_dir, {"status": "running"})
-        # 1) Kör Playwright-capture (async)
-        await capture_network(ar_input, run_dir=job_dir)
-        # 2) Efterbearbetning (sync)
-        ok = process_candidates_and_save(run_dir=job_dir)
-        if not ok:
-            write_status(job_dir, {"status": "error", "error": "processing_failed"})
-            return
-        write_status(job_dir, {"status": "done"})
-    except Exception as e:
-        # Skriv fel så frontend kan visa det
-        write_status(job_dir, {"status": "error", "error": str(e)})
+# ----- Lagring -----
+RUNS_DIR = Path(os.getenv("RUNS_DIR", "/tmp/runs"))
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------------------------------------------
-# API-endpoints
-# -------------------------------------------------------------------
+def write_json(p: Path, obj: dict):
+    p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+
+def append_log(job_dir: Path, line: str):
+    lp = job_dir / "log.txt"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with lp.open("a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {line}\n")
+
+def write_status(job_dir: Path, **fields):
+    sp = job_dir / "status.json"
+    data = {"status": "running", "progress": None, "message": None}
+    if sp.exists():
+        try:
+            data.update(json.loads(sp.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    data.update(fields)
+    write_json(sp, data)
+
+def read_status(job_dir: Path):
+    sp = job_dir / "status.json"
+    if not sp.exists():
+        return None
+    try:
+        return json.loads(sp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+# ----- Jobb -----
+OVERALL_DEADLINE_SEC = int(os.getenv("OVERALL_DEADLINE_SEC", "1200"))  # 20 min hårdgräns
+
+async def run_with_timeout(coro, timeout_sec: int, step_name: str, job_dir: Path):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        append_log(job_dir, f"TIMEOUT i steg: {step_name} ({timeout_sec}s)")
+        raise RuntimeError(f"timeout_{step_name}")
+    except Exception as e:
+        append_log(job_dir, f"FEL i steg: {step_name}: {e}")
+        raise
+
+async def do_job(job_id: str, ar_input: str):
+    job_dir = RUNS_DIR / job_id
+    append_log(job_dir, f"JOB START ar_input='{ar_input}'")
+    try:
+        write_status(job_dir, status="running", progress=1, message="Initierar…")
+
+        # WATCHDOG för hela jobbet
+        async def whole():
+            write_status(job_dir, progress=5, message="Fångar nätverk…")
+            # Capture (lägg gärna egen timeout här – t.ex. 12 min)
+            await run_with_timeout(
+                capture_network(ar_input, run_dir=job_dir),
+                timeout_sec=12 * 60,
+                step_name="capture_network",
+                job_dir=job_dir,
+            )
+
+            write_status(job_dir, progress=70, message="Bearbetar och bygger Excel…")
+            # Kör synk del i thread och sätt timeout (t.ex. 6 min)
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, process_candidates_and_save, job_dir),
+                timeout=6 * 60
+            )
+
+        await asyncio.wait_for(whole(), timeout=OVERALL_DEADLINE_SEC)
+
+        excel = job_dir / "ads_extracted.xlsx"
+        if excel.exists():
+            write_status(job_dir, status="done", progress=100, message="Klart.")
+            append_log(job_dir, "JOB DONE")
+        else:
+            write_status(job_dir, status="error", message="Excel saknas efter bearbetning.")
+            append_log(job_dir, "JOB ERROR: Excel saknas")
+    except Exception as e:
+        tb = traceback.format_exc(limit=5)
+        write_status(job_dir, status="error", message=str(e))
+        append_log(job_dir, f"JOB ERROR: {e}\n{tb}")
+
 @app.post("/run")
 async def run(ar_input: str = Form(...)):
-    """Startar ett nytt jobb och returnerar job_id direkt."""
     job_id = uuid.uuid4().hex[:12]
     job_dir = RUNS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    write_status(job_dir, {"status": "queued"})
+    write_status(job_dir, status="queued", progress=0, message="Köad")
+    append_log(job_dir, "Job skapades; ställer i kö…")
 
-    # Schemalägg coroutinen på NUVARANDE event-loop (inte BackgroundTasks)
     asyncio.create_task(do_job(job_id, ar_input.strip()))
     return {"job_id": job_id, "status": "queued"}
 
 @app.get("/status/{job_id}")
 def status(job_id: str, request: Request):
-    """Returnerar status för ett jobb och (om klart) en download-URL."""
     job_dir = RUNS_DIR / job_id
     data = read_status(job_dir)
     if not data or "status" not in data:
@@ -113,7 +161,6 @@ def status(job_id: str, request: Request):
 
 @app.get("/download/{job_id}", name="download")
 def download(job_id: str):
-    """Returnerar Excel-filen för ett färdigt jobb."""
     job_dir = RUNS_DIR / job_id
     excel = job_dir / "ads_extracted.xlsx"
     if not excel.exists():
@@ -123,3 +170,11 @@ def download(job_id: str):
         filename=f"ads_extracted_{job_id}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+@app.get("/logs/{job_id}")
+def get_logs(job_id: str):
+    job_dir = RUNS_DIR / job_id
+    p = job_dir / "log.txt"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+    return PlainTextResponse(p.read_text(encoding="utf-8"))
