@@ -1,20 +1,17 @@
 # Dockerfile
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 WORKDIR /app
 COPY . /app
-# OCR (Tesseract) + språk
-RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    tesseract-ocr-swe \
-    libtesseract-dev \
- && rm -rf /var/lib/apt/lists/*
 
+# Python deps
 RUN pip install --no-cache-dir -r requirements.txt
-# Basimagen har redan browsers, men detta är ok:
+
+# Säkerställ Playwright-browsers & deps
 RUN playwright install --with-deps
 
+# Exponera port som Render förser via $PORT
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn webapi:app --host 0.0.0.0 --port ${PORT:-8000}"]
 
+# Starta FastAPI
+CMD ["sh", "-c", "uvicorn webapi:app --host 0.0.0.0 --port ${PORT:-8000}"]
