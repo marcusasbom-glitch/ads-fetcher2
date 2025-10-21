@@ -12,5 +12,6 @@ pytesseract==0.3.10
 opencv-python-headless==4.10.0.84
 numpy>=1.26.0
 xlsxwriter>=3.1.2   # (om du skriver .xlsx med xlsxwriter)
+easyocr
 
 
