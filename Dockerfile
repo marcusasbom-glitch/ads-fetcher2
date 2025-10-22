@@ -1,22 +1,24 @@
-# ---- Dockerfile (python:slim + manuell Playwright) ----
-FROM python:3.11-slim
+# ---- Dockerfile (Playwright + OCR + requests) ----
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
-# Systemberoenden + Tesseract (Playwright deps installeras av kommandot nedan)
+# OCR-binaries (svenska + engelska)
 RUN apt-get update && apt-get install -y \
-    tesseract-ocr tesseract-ocr-swe tesseract-ocr-eng \
+    tesseract-ocr \
+    tesseract-ocr-swe \
+    tesseract-ocr-eng \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
 
-# Installera Python-deps, inkl. playwright
+# Pythonpaket
 RUN pip install --no-cache-dir \
     fastapi uvicorn[standard] python-multipart \
     pandas openpyxl \
-    pillow opencv-python-headless pytesseract \
-    playwright
+    pillow opencv-python-headless pytesseract numpy \
+    requests
 
-# Installera Chromium + dess systemberoenden via Playwright
+# (Chromium finns i basimagen, men detta säkerställer rätt version/dep.)
 RUN python -m playwright install --with-deps chromium
 
 CMD ["uvicorn", "webapi:app", "--host", "0.0.0.0", "--port", "8000"]
