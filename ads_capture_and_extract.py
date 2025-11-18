@@ -1,5 +1,5 @@
 # ads_capture_and_extract.py
-# Komplett capture + extraction med run_dir-stöd + OCR av rubrik/beskrivning ur bild
+# Komplett capture + extraction med run_dir-stöd
 
 import asyncio
 import os
@@ -16,13 +16,6 @@ from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
-
-# ==== OCR imports ====
-import pytesseract
-from pytesseract import Output
-import cv2
-import numpy as np
-from collections import defaultdict
 
 # ----- Globala "pekare" som kan flyttas till valfri run_dir -----
 OUTPUT_DIR = Path("network_dump")
@@ -105,60 +98,6 @@ def get_available_filename(base_name):
         candidate = base.parent / f"{stem}_{counter}{suff}"
         counter += 1
     return str(candidate)
-
-# ====== OCR: hämta H1/H2 ur annonsbild ======
-def ocr_h1_h2_from_image(img_path: str, lang: str = "swe+eng"):
-    """
-    Returnerar (h1, h2) gissade rubriker ur en bild.
-    Heuristik: plocka de 2 "största" textraderna (utifrån bbox-höjd) med vettig conf.
-    """
-    try:
-        im = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if im is None:
-            im = cv2.cvtColor(np.array(Image.open(img_path).convert("RGB")), cv2.COLOR_RGB2BGR)
-
-        g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-        h, w = g.shape[:2]
-        if max(h, w) < 1400:
-            g = cv2.resize(g, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-        g = cv2.bilateralFilter(g, 7, 50, 50)
-        g = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY, 31, 10)
-
-        data = pytesseract.image_to_data(g, lang=lang, output_type=Output.DICT)
-
-        lines = defaultdict(lambda: {"texts": [], "heights": [], "confs": []})
-        n = len(data["text"])
-        for i in range(n):
-            txt = (data["text"][i] or "").strip()
-            conf = float(data["conf"][i]) if data["conf"][i] not in ("-1", None, "") else -1.0
-            if not txt or conf < 40:
-                continue
-            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines[key]["texts"].append(txt)
-            lines[key]["heights"].append(int(data["height"][i]) or 0)
-            lines[key]["confs"].append(conf)
-
-        scored = []
-        for info in lines.values():
-            text = " ".join(info["texts"]).strip()
-            if len(text) < 3:
-                continue
-            avg_h = float(np.mean(info["heights"])) if info["heights"] else 0.0
-            mean_conf = float(np.mean(info["confs"])) if info["confs"] else 0.0
-            score = avg_h * (mean_conf / 100.0) * (1 + np.log1p(len(text)))
-            scored.append((score, text))
-
-        if not scored:
-            return None, None
-        scored.sort(reverse=True, key=lambda x: x[0])
-        h1 = scored[0][1]
-        h2 = scored[1][1] if len(scored) > 1 else None
-        if h2 and h1 and h2.strip().lower() == h1.strip().lower():
-            h2 = None
-        return h1, h2
-    except Exception:
-        return None, None
 
 
 # ---------- Capture (Playwright) ----------
@@ -294,7 +233,6 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     """
     Läser ads_candidates.json, laddar ner bilder och skapar en Excel med metadata + inbäddade bilder.
-    NU: OCR-ar varje bild och lägger till kolumnerna 'H1 (OCR)' och 'H2 (OCR)'.
     """
     set_paths(run_dir)
 
@@ -374,9 +312,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 image_url = scan_for_img(entry)
 
             image_file = ""
-            h1_ocr = None
-            h2_ocr = None
-
             if image_url:
                 try:
                     if image_url.startswith("//"):
@@ -394,12 +329,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                             for chunk in r.iter_content(1024):
                                 wf.write(chunk)
                         image_file = str(file_path)
-
-                        # ---- OCR här (på den sparade bilden) ----
-                        try:
-                            h1_ocr, h2_ocr = ocr_h1_h2_from_image(image_file)
-                        except Exception:
-                            h1_ocr = h2_ocr = None
                 except Exception:
                     image_file = ""
 
@@ -410,9 +339,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 "Rubrik": headline,
                 "Beskrivning": description,
                 "Bild-URL": image_url or "",
-                "Bildfil": image_file,
-                "H1 (OCR)": h1_ocr,
-                "H2 (OCR)": h2_ocr,
+                "Bildfil": image_file
             })
 
     if not rows:
@@ -421,8 +348,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 
     excel_path = get_available_filename(OUTPUT_EXCEL)
     df = pd.DataFrame(rows, columns=[
-        "SourceFile", "CreativeID", "Annonsör", "Rubrik", "Beskrivning",
-        "Bild-URL", "Bildfil", "H1 (OCR)", "H2 (OCR)"
+        "SourceFile", "CreativeID", "Annonsör", "Rubrik", "Beskrivning", "Bild-URL", "Bildfil"
     ])
     df.to_excel(excel_path, index=False)
     print(f"Sparade tabell till {excel_path} (bildvägar i kolumn 'Bildfil').")
@@ -430,7 +356,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     # Infoga bilder i Excel
     wb = load_workbook(excel_path)
     ws = wb.active
-    # kolumnindex: A=1.. G=7 (Bildfil i kol G i ovan ordning), våra OCR-kolumner är H/I
     for idx, r in enumerate(rows, start=2):
         img_path = r.get("Bildfil")
         if img_path:
@@ -438,18 +363,16 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 xlimg = XLImage(img_path)
                 xlimg.width = 160
                 xlimg.height = 90
-                # Bilden placeras i kolumn G (7) enligt DF-ordningen ovan
                 ws.add_image(xlimg, f"G{idx}")
                 ws.row_dimensions[idx].height = 80
             except Exception as e:
                 print(f"Fel vid inbäddning av bild för rad {idx}: {e}")
 
-    # Auto-bredd
     for i, col in enumerate(df.columns, start=1):
         col_letter = get_column_letter(i)
         maxlen = max((len(str(x)) for x in df[col]), default=len(col))
         ws.column_dimensions[col_letter].width = min(maxlen + 8, 80)
 
     wb.save(excel_path)
-    print(f"✅ Excel med inbäddade bilder + H1/H2 (OCR) sparad som: {excel_path}")
+    print(f"✅ Excel med inbäddade bilder sparad som: {excel_path}")
     return True
