@@ -1,42 +1,24 @@
 # webapi.py
-from __future__ import annotations
-
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    FileResponse,
-    Response,
-    JSONResponse,
-    PlainTextResponse,
-)
+from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 from pathlib import Path
-import os
-import json
-import uuid
-import asyncio
-import traceback
-import time
+import os, json, uuid, asyncio, traceback, time
 
-# === Din pipeline ===
-# capture_network: async – hämtar/lagrar material i run_dir
-# process_candidates_and_save: sync – bearbetar & skriver ads_extracted.xlsx
 from ads_capture_and_extract import capture_network, process_candidates_and_save
 
-# -------------------------------------------------------------------
-# App & CORS
-# -------------------------------------------------------------------
 app = FastAPI()
 
-# Öppen CORS för enkel testning. När allt fungerar kan du låsa ner allow_origins.
+# ----- CORS -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # ex: ["https://din-domän.se", "https://www.din-domän.se"]
-    allow_methods=["*"],        # GET, POST, OPTIONS, ...
-    allow_headers=["*"],        # Content-Type m.m.
-    allow_credentials=False,    # håll False när du använder "*"
+    allow_origins=["*"],        # lås gärna ner till dina domäner när allt funkar
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
 )
 
-# Fångar ALLA OPTIONS (preflight) och svarar 204 så att proxies/gateways inte ger 405.
+# OPTIONS catch-all så preflight aldrig blir 405
 @app.options("/{rest_of_path:path}")
 def preflight_catchall(rest_of_path: str, request: Request):
     origin = request.headers.get("origin", "*")
@@ -45,63 +27,54 @@ def preflight_catchall(rest_of_path: str, request: Request):
         "Access-Control-Allow-Origin": origin,
         "Vary": "Origin",
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": acrh or "*",
+        "Access-Control-Allow-Headers": acrh,
         "Access-Control-Max-Age": "86400",
     }
     return Response(status_code=204, headers=headers)
 
-# -------------------------------------------------------------------
-# Root/health
-# -------------------------------------------------------------------
+# ----- Root/health -----
 @app.get("/")
 def root():
-    return JSONResponse({
-        "ok": True,
-        "service": "ads-fetcher",
-        "endpoints": ["/ping", "/run", "/status/{job_id}", "/download/{job_id}", "/logs/{job_id}", "/debug/{job_id}"]
-    })
+    return JSONResponse({"ok": True, "service": "ads-fetcher",
+                         "endpoints": ["/ping", "/run", "/status/{job_id}", "/download/{job_id}", "/logs/{job_id}"]})
 
 @app.head("/")
 def root_head():
-    # tomt 200-svar för health checks som använder HEAD
     return Response(status_code=200)
 
 @app.get("/favicon.ico")
 def favicon():
-    # ingen favicon – returnera 204 så slipper vi 405 i loggarna
     return Response(status_code=204)
 
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
-# -------------------------------------------------------------------
-# Lagring & hjälpmetoder
-# -------------------------------------------------------------------
+# ----- Lagring -----
 RUNS_DIR = Path(os.getenv("RUNS_DIR", "/tmp/runs"))
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _write_json(p: Path, obj: dict):
+def write_json(p: Path, obj: dict):
     p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
 
-def _append_log(job_dir: Path, line: str):
+def append_log(job_dir: Path, line: str):
     lp = job_dir / "log.txt"
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with lp.open("a", encoding="utf-8") as f:
         f.write(f"[{ts}] {line}\n")
 
-def _write_status(job_dir: Path, **fields):
+def write_status(job_dir: Path, **fields):
     sp = job_dir / "status.json"
-    data = {"status": "running", "progress": None, "message": None, "error": None}
+    data = {"status": "running", "progress": None, "message": None}
     if sp.exists():
         try:
             data.update(json.loads(sp.read_text(encoding="utf-8")))
         except Exception:
             pass
     data.update(fields)
-    _write_json(sp, data)
+    write_json(sp, data)
 
-def _read_status(job_dir: Path):
+def read_status(job_dir: Path):
     sp = job_dir / "status.json"
     if not sp.exists():
         return None
@@ -110,81 +83,73 @@ def _read_status(job_dir: Path):
     except Exception:
         return None
 
-# -------------------------------------------------------------------
-# Jobb-logik
-# -------------------------------------------------------------------
-# Hårdgräns för hela jobbet (sekunder)
-OVERALL_DEADLINE_SEC = int(os.getenv("OVERALL_DEADLINE_SEC", "1200"))  # 20 min
+# ----- Jobb -----
+OVERALL_DEADLINE_SEC = int(os.getenv("OVERALL_DEADLINE_SEC", "1200"))  # 20 min hårdgräns
+
+async def run_with_timeout(coro, timeout_sec: int, step_name: str, job_dir: Path):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        append_log(job_dir, f"TIMEOUT i steg: {step_name} ({timeout_sec}s)")
+        raise RuntimeError(f"timeout_{step_name}")
+    except Exception as e:
+        append_log(job_dir, f"FEL i steg: {step_name}: {e}")
+        raise
 
 async def do_job(job_id: str, ar_input: str):
-    """Kör hela pipeline för ett job_id."""
     job_dir = RUNS_DIR / job_id
-    _append_log(job_dir, f"JOB START ar_input='{ar_input}'")
+    append_log(job_dir, f"JOB START ar_input='{ar_input}'")
     try:
-        _write_status(job_dir, status="running", progress=1, message="Initierar…")
+        write_status(job_dir, status="running", progress=1, message="Initierar…")
 
-        # 1) Capture – Playwright (async) med timeout
-        _write_status(job_dir, progress=5, message="Fångar nätverk…")
-        try:
-            await asyncio.wait_for(
+        # WATCHDOG för hela jobbet
+        async def whole():
+            write_status(job_dir, progress=5, message="Fångar nätverk…")
+            # Capture (lägg gärna egen timeout här – t.ex. 12 min)
+            await run_with_timeout(
                 capture_network(ar_input, run_dir=job_dir),
-                timeout=12 * 60,  # 12 minuter
+                timeout_sec=12 * 60,
+                step_name="capture_network",
+                job_dir=job_dir,
             )
-        except asyncio.TimeoutError:
-            _write_status(job_dir, status="error", error="timeout_capture_network", message="Timeout i capture_network")
-            _append_log(job_dir, "TIMEOUT i capture_network (12 min)")
-            return
 
-        # 2) Processing & Excel (körs i thread pool) med timeout
-        _write_status(job_dir, progress=70, message="Bearbetar och bygger Excel…")
-        try:
-            ok = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(None, process_candidates_and_save, job_dir, ar_input),
-                timeout=6 * 60,  # 6 minuter
+            write_status(job_dir, progress=70, message="Bearbetar och bygger Excel…")
+            # Kör synk del i thread och sätt timeout (t.ex. 6 min)
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, process_candidates_and_save, job_dir),
+                timeout=6 * 60
             )
-        except asyncio.TimeoutError:
-            _write_status(job_dir, status="error", error="timeout_processing", message="Timeout i efterbearbetning")
-            _append_log(job_dir, "TIMEOUT i process_candidates_and_save (6 min)")
-            return
 
-        if not ok:
-            _write_status(job_dir, status="error", error="processing_failed", message="Inga annonser hittades eller fil saknas")
-            _append_log(job_dir, "JOB ERROR: processing_failed")
-            return
+        await asyncio.wait_for(whole(), timeout=OVERALL_DEADLINE_SEC)
 
         excel = job_dir / "ads_extracted.xlsx"
         if excel.exists():
-            _write_status(job_dir, status="done", progress=100, message="Klart.")
-            _append_log(job_dir, "JOB DONE")
+            write_status(job_dir, status="done", progress=100, message="Klart.")
+            append_log(job_dir, "JOB DONE")
         else:
-            _write_status(job_dir, status="error", error="excel_missing", message="Excel saknas efter bearbetning")
-            _append_log(job_dir, "JOB ERROR: Excel saknas")
+            write_status(job_dir, status="error", message="Excel saknas efter bearbetning.")
+            append_log(job_dir, "JOB ERROR: Excel saknas")
     except Exception as e:
         tb = traceback.format_exc(limit=5)
-        _write_status(job_dir, status="error", error=type(e).__name__, message=str(e))
-        _append_log(job_dir, f"JOB ERROR: {e}\n{tb}")
+        write_status(job_dir, status="error", message=str(e))
+        append_log(job_dir, f"JOB ERROR: {e}\n{tb}")
 
-# -------------------------------------------------------------------
-# API-endpoints
-# -------------------------------------------------------------------
 @app.post("/run")
 async def run(ar_input: str = Form(...)):
-    """Startar ett nytt jobb och returnerar job_id direkt."""
     job_id = uuid.uuid4().hex[:12]
     job_dir = RUNS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    _write_status(job_dir, status="queued", progress=0, message="Köad")
-    _append_log(job_dir, "Job skapades; ställer i kö…")
+    write_status(job_dir, status="queued", progress=0, message="Köad")
+    append_log(job_dir, "Job skapades; ställer i kö…")
 
-    # Schemalägg coroutinen på nuvarande event-loop
     asyncio.create_task(do_job(job_id, ar_input.strip()))
     return {"job_id": job_id, "status": "queued"}
 
 @app.get("/status/{job_id}")
 def status(job_id: str, request: Request):
-    """Returnerar status för ett jobb och (om klart) en download-URL."""
     job_dir = RUNS_DIR / job_id
-    data = _read_status(job_dir)
+    data = read_status(job_dir)
     if not data or "status" not in data:
         raise HTTPException(status_code=404, detail="unknown_job_id")
 
@@ -196,7 +161,6 @@ def status(job_id: str, request: Request):
 
 @app.get("/download/{job_id}", name="download")
 def download(job_id: str):
-    """Returnerar Excel-filen för ett färdigt jobb."""
     job_dir = RUNS_DIR / job_id
     excel = job_dir / "ads_extracted.xlsx"
     if not excel.exists():
@@ -207,46 +171,10 @@ def download(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# -------------------------------------------------------------------
-# Felsökning
-# -------------------------------------------------------------------
 @app.get("/logs/{job_id}")
 def get_logs(job_id: str):
-    """
-    Returnerar log.txt om den finns; annars status.json som text.
-    Om inget av dem finns listar vi filerna för att underlätta felsökning.
-    """
     job_dir = RUNS_DIR / job_id
-    if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="job_dir_missing")
-
-    log_p = job_dir / "log.txt"
-    st_p  = job_dir / "status.json"
-
-    if log_p.exists():
-        return PlainTextResponse(log_p.read_text(encoding="utf-8"))
-
-    if st_p.exists():
-        text = st_p.read_text(encoding="utf-8")
-        return PlainTextResponse(f"[no log.txt]\nstatus.json:\n{text}")
-
-    files = []
-    for p in job_dir.rglob("*"):
-        if p.is_file():
-            files.append(p.relative_to(job_dir).as_posix())
-    raise HTTPException(status_code=404, detail={"reason": "no_log_or_status", "files": files})
-
-@app.get("/debug/{job_id}")
-def debug_job(job_id: str):
-    """Listar hela jobbkatalogen (väldigt användbart när något saknas)."""
-    job_dir = RUNS_DIR / job_id
-    if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="job_dir_missing")
-    tree = []
-    for p in job_dir.rglob("*"):
-        tree.append({
-            "path": p.relative_to(job_dir).as_posix(),
-            "dir": p.is_dir(),
-            "size": (p.stat().st_size if p.is_file() else None)
-        })
-    return {"job_dir": str(job_dir), "files": tree}
+    p = job_dir / "log.txt"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+    return PlainTextResponse(p.read_text(encoding="utf-8"))
