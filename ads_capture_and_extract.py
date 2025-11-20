@@ -72,7 +72,10 @@ def get_available_filename(base: str) -> str:
 async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> bool:
     """
     Kör Playwright, fångar nätverkstrafik och skriver responses till OUTPUT_DIR.
-    Skapar ads_candidates.json med ALL JSON vi senare skannar efter annonser.
+    Skapar ads_candidates.json med JSON vi senare skannar efter annonser.
+
+    Viktigt: här försöker vi identifiera JSON baserat på *innehållet* i body,
+    inte bara på Content-Type, eftersom Google ofta skickar JSON som text/html.
     """
     set_paths(run_dir)
 
@@ -101,7 +104,8 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                 r_url = response.url
                 method = response.request.method if response.request else "GET"
                 status = response.status
-                ct = (response.headers or {}).get("content-type", "").lower()
+                headers = response.headers or {}
+                ct = headers.get("content-type", "").lower()
 
                 meta = {
                     "url": r_url,
@@ -110,53 +114,55 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                     "content_type": ct,
                 }
 
-                should_save = False
-                ext = None
+                # Vi bryr oss huvudsakligen om requests till adstransparency.google.com
+                if "adstransparency.google.com" not in r_url:
+                    responses_meta.append(meta)
+                    return
 
-                # Spara all JSON (vi filtrerar i nästa steg)
-                if "application/json" in ct:
-                    should_save = True
-                    ext = ".json"
-                elif any(k in r_url for k in ["ad", "creative", "asset", "search", "list"]):
-                    if any(t in ct for t in ["text/html", "text/plain", "application/javascript"]):
-                        should_save = True
-                        ext = ".txt"
+                # Hämta body (begränsa storlek lite för säkerhets skull)
+                try:
+                    body = await response.body()
+                except Exception as e:
+                    meta["body_error"] = f"body_error: {e}"
+                    responses_meta.append(meta)
+                    return
+
+                if not body or len(body) > 5_000_000:
+                    responses_meta.append(meta)
+                    return
+
+                try:
+                    txt = body.decode("utf-8", errors="ignore")
+                except Exception:
+                    # om vi inte ens kan dekoda som text – skippa
+                    responses_meta.append(meta)
+                    return
+
+                trimmed = txt.lstrip()
+                # Google har ofta prefix: )]}'
+                if trimmed.startswith(")]}'"):
+                    trimmed_json = trimmed[4:].lstrip()
+                else:
+                    trimmed_json = trimmed
+
+                is_jsonish = trimmed_json.startswith("{") or trimmed_json.startswith("[")
+                should_save = "application/json" in ct or is_jsonish
 
                 if should_save:
                     safe_name = sanitize_filename(r_url)
                     if len(safe_name) > 80:
                         safe_name = safe_name[-80:]
                     base_name = f"{int(time.time()*1000)}_{safe_name}"
-                    meta["saved_as"] = base_name + (ext or "")
 
-                    if "application/json" in ct:
-                        try:
-                            body = await response.body()
-                            txt = body.decode("utf-8", errors="ignore")
-                            (OUTPUT_DIR / (base_name + ".json")).write_text(
-                                txt, encoding="utf-8"
-                            )
-                            meta["saved"] = base_name + ".json"
-                        except Exception as e:
-                            meta["error"] = f"json_save_error: {e}"
-                    elif any(t in ct for t in ("text/html", "text/plain", "application/javascript")):
-                        try:
-                            text = await response.text()
-                            filep = OUTPUT_DIR / (base_name + ".txt")
-                            filep.write_text(text, encoding="utf-8")
-                            meta["saved"] = filep.name
-                        except Exception as e:
-                            meta["error"] = f"text_save_error: {e}"
-                    else:
-                        try:
-                            body = await response.body()
-                            if body and len(body) < 5_000_000:
-                                (OUTPUT_DIR / (base_name + ".bin")).write_bytes(body)
-                                meta["saved"] = base_name + ".bin"
-                        except Exception as e:
-                            meta["error"] = f"binary_save_error: {e}"
+                    # spara rå text som .json – vi har redan strippat prefix
+                    out_txt = trimmed_json
+                    (OUTPUT_DIR / (base_name + ".json")).write_text(
+                        out_txt, encoding="utf-8"
+                    )
+                    meta["saved"] = base_name + ".json"
 
                 responses_meta.append(meta)
+
             except Exception as e:
                 print("on_response error:", e)
 
@@ -167,7 +173,7 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
         except Exception as e:
             print("⚠️ page.goto error:", e)
 
-        # Scrolla några gånger för att trigga lazy loads
+        # scrolla några gånger för att trigga lazy loads
         for _ in range(5):
             try:
                 await page.evaluate("window.scrollBy(0, window.innerHeight);")
@@ -177,7 +183,7 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 
         await asyncio.sleep(1.0)
 
-        # Spara index
+        # spara index
         (OUTPUT_DIR / "responses_index.json").write_text(
             json.dumps(responses_meta, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -187,13 +193,14 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
             f"{OUTPUT_DIR / 'responses_index.json'}"
         )
 
-        # Läs alla JSON-filer och lägg dem som kandidater
+        # läs alla json-filer och lägg dem som kandidater
         ad_candidates = []
-        for f in sorted(OUTPUT_DIR.glob("*.json")):
+        json_files = sorted(OUTPUT_DIR.glob("*.json"))
+        print(f"🗂️ Hittade {len(json_files)} .json-filer i {OUTPUT_DIR}")
+        for f in json_files:
             try:
                 txt = f.read_text(encoding="utf-8")
-                cleaned = txt.lstrip(")]}',\n ")
-                parsed = json.loads(cleaned)
+                parsed = json.loads(txt)
                 ad_candidates.append({"source_file": f.name, "parsed": parsed})
             except Exception as e:
                 print(f"⚠️ kunde inte parsa {f.name}: {e}")
@@ -259,7 +266,9 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     # Google-nummernycklar som ofta används i dessa protobuff-liknande JSON:er
     NUMERIC_KEYS = {"2", "3", "7", "8", "12"}
 
-    IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+    IMG_SRC_RE = re.compile(
+        r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE
+    )
     HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
     def scan_for_img(obj):
