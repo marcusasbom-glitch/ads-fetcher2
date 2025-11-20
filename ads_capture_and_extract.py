@@ -422,7 +422,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         "Bildfil"
     ])
 
-    ])
     df.to_excel(excel_path, index=False)
     print(f"📊 Grund-Excel (utan inbäddade bilder) sparad som: {excel_path}")
 
@@ -479,4 +478,5 @@ if __name__ == "__main__":
             process_candidates_and_save(args.run_dir)
 
     asyncio.run(main())
+
 
