@@ -1,6 +1,5 @@
 # ads_capture_and_extract.py
-# Capture + extraction för Google Ads Transparency
-# Ny version: enklare heuristik – letar rekursivt efter annons-objekt i all JSON.
+# Capture + extraction för Google Ads Transparency med run_dir-stöd
 
 import asyncio
 import os
@@ -18,7 +17,7 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 
-# ----- Globala "pekare" som kan flyttas till valfri run_dir -----
+# ----- Globala paths som pekas om per jobb -----
 OUTPUT_DIR = Path("network_dump")
 CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
@@ -29,9 +28,7 @@ DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False
 
 
 def set_paths(base_dir: Path | str | None):
-    """
-    Pekar om alla outputvägar till given run_dir (används per-jobb).
-    """
+    """Pekar om alla output-vägar till given run_dir (används per-jobb)."""
     global OUTPUT_DIR, CANDIDATES_PATH, IMAGES_DIR, OUTPUT_EXCEL
     if base_dir is None:
         base_dir = Path(".")
@@ -52,16 +49,12 @@ def set_paths(base_dir: Path | str | None):
 # ---------- Hjälpfunktioner ----------
 
 def sanitize_filename(name: str) -> str:
-    """
-    Rensar bort otillåtna tecken i filnamn.
-    """
+    """Tar bort otillåtna tecken i filnamn."""
     return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
 
 
 def get_available_filename(base: str) -> str:
-    """
-    Om filen finns, lägg på _1, _2, etc.
-    """
+    """Om filen finns, lägg på _1, _2, etc."""
     p = Path(base)
     if not p.exists():
         return str(p)
@@ -79,7 +72,7 @@ def get_available_filename(base: str) -> str:
 async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> bool:
     """
     Kör Playwright, fångar nätverkstrafik och skriver responses till OUTPUT_DIR.
-    Skapar också ads_candidates.json som innehåller ALL JSON som vi senare söker annonser i.
+    Skapar ads_candidates.json med ALL JSON vi senare skannar efter annonser.
     """
     set_paths(run_dir)
 
@@ -93,7 +86,7 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
         )
     print(f"🔗 Laddar: {url}")
 
-    responses_meta = []
+    responses_meta: list[dict] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -105,14 +98,13 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 
         async def on_response(response):
             try:
-                url = response.url
-                req = response.request
-                method = req.method
+                r_url = response.url
+                method = response.request.method if response.request else "GET"
                 status = response.status
-                ct = response.headers.get("content-type", "").lower()
+                ct = (response.headers or {}).get("content-type", "").lower()
 
                 meta = {
-                    "url": url,
+                    "url": r_url,
                     "method": method,
                     "status": status,
                     "content_type": ct,
@@ -121,16 +113,17 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                 should_save = False
                 ext = None
 
+                # Spara all JSON (vi filtrerar i nästa steg)
                 if "application/json" in ct:
                     should_save = True
                     ext = ".json"
-                elif any(s in url for s in ["ad", "creative", "asset", "search", "list"]):
+                elif any(k in r_url for k in ["ad", "creative", "asset", "search", "list"]):
                     if any(t in ct for t in ["text/html", "text/plain", "application/javascript"]):
                         should_save = True
                         ext = ".txt"
 
                 if should_save:
-                    safe_name = sanitize_filename(url)
+                    safe_name = sanitize_filename(r_url)
                     if len(safe_name) > 80:
                         safe_name = safe_name[-80:]
                     base_name = f"{int(time.time()*1000)}_{safe_name}"
@@ -140,16 +133,18 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                         try:
                             body = await response.body()
                             txt = body.decode("utf-8", errors="ignore")
-                            (OUTPUT_DIR / (base_name + ".json")).write_text(txt, encoding="utf-8")
-                            meta["saved"] = str((base_name + ".json"))
+                            (OUTPUT_DIR / (base_name + ".json")).write_text(
+                                txt, encoding="utf-8"
+                            )
+                            meta["saved"] = base_name + ".json"
                         except Exception as e:
                             meta["error"] = f"json_save_error: {e}"
-                    elif any(ct2 in ct for ct2 in ("text/html", "text/plain", "application/javascript")):
+                    elif any(t in ct for t in ("text/html", "text/plain", "application/javascript")):
                         try:
                             text = await response.text()
                             filep = OUTPUT_DIR / (base_name + ".txt")
                             filep.write_text(text, encoding="utf-8")
-                            meta["saved"] = str(filep.name)
+                            meta["saved"] = filep.name
                         except Exception as e:
                             meta["error"] = f"text_save_error: {e}"
                     else:
@@ -172,45 +167,46 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
         except Exception as e:
             print("⚠️ page.goto error:", e)
 
-        # Scrolla lite för att trigga lazy loads
+        # Scrolla några gånger för att trigga lazy loads
         for _ in range(5):
             try:
                 await page.evaluate("window.scrollBy(0, window.innerHeight);")
-                await asyncio.sleep(0.5)
             except Exception:
-                await asyncio.sleep(0.5)
+                pass
+            await asyncio.sleep(0.5)
 
         await asyncio.sleep(1.0)
 
-        # index
+        # Spara index
         (OUTPUT_DIR / "responses_index.json").write_text(
             json.dumps(responses_meta, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            encoding="utf-8",
         )
-        print(f"📦 Sparade index med {len(responses_meta)} responses => {OUTPUT_DIR/'responses_index.json'}")
+        print(
+            f"📦 Sparade index med {len(responses_meta)} responses => "
+            f"{OUTPUT_DIR / 'responses_index.json'}"
+        )
 
-        # ---- LÄS ALLA JSON-FILER OCH SPARA SOM KANDIDATER ----
+        # Läs alla JSON-filer och lägg dem som kandidater
         ad_candidates = []
         for f in sorted(OUTPUT_DIR.glob("*.json")):
             try:
                 txt = f.read_text(encoding="utf-8")
                 cleaned = txt.lstrip(")]}',\n ")
                 parsed = json.loads(cleaned)
-                ad_candidates.append({
-                    "source_file": f.name,
-                    "parsed": parsed
-                })
+                ad_candidates.append({"source_file": f.name, "parsed": parsed})
             except Exception as e:
                 print(f"⚠️ kunde inte parsa {f.name}: {e}")
                 continue
 
         CANDIDATES_PATH.write_text(
             json.dumps(ad_candidates, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            encoding="utf-8",
         )
         print(f"🔎 Sparade {len(ad_candidates)} JSON-kandidater i {CANDIDATES_PATH}")
 
         await browser.close()
+
     return True
 
 
@@ -218,40 +214,65 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 
 def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     """
-    Läser ads_candidates.json, letar rekursivt efter "annons-liknande" objekt,
-    laddar ned bilder och skapar en Excel med metadata + inbäddade bilder.
+    Läser ads_candidates.json, letar rekursivt efter annons-objekt,
+    laddar ner bilder och skapar en Excel med metadata + inbäddade bilder.
     """
     set_paths(run_dir)
 
     if not CANDIDATES_PATH.exists():
-        print(f"Fel: kunde inte hitta {CANDIDATES_PATH}. Kör först capture_network(ar_input).")
+        print(
+            f"Fel: kunde inte hitta {CANDIDATES_PATH}. "
+            f"Kör först capture_network(ar_input)."
+        )
         return False
 
     with open(CANDIDATES_PATH, "r", encoding="utf-8") as f:
         candidates = json.load(f)
 
-    rows = []
+    rows: list[dict] = []
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
     ads_count = 0
 
-    # ----- Funktioner för att hitta annonser i JSON -----
-
-    AD_KEYS = {
-        "advertiserName", "advertiser", "headline", "headlineText",
-        "description", "bodyText", "creativeId", "adId",
-        "callToAction", "ctaText", "imageUrl", "finalUrl",
-        "landingPageUrl", "displayUrl"
+    # Nycklar som brukar finnas i "text-baserade" annonsobjekt
+    AD_TEXT_KEYS = {
+        "advertiserName",
+        "advertiser",
+        "headline",
+        "headlineText",
+        "description",
+        "bodyText",
+        "creativeId",
+        "adId",
+        "callToAction",
+        "ctaText",
+        "finalUrl",
+        "landingPageUrl",
+        "displayUrl",
+        "imageUrl",
+        "image_url",
+        "title",
+        "primaryText",
+        "secondaryText",
     }
 
+    # Google-nummernycklar som ofta används i dessa protobuff-liknande JSON:er
+    NUMERIC_KEYS = {"2", "3", "7", "8", "12"}
+
+    IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+    HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
     def scan_for_img(obj):
-        IMG_SRC_RE = re.compile(r'src="([^"]+)"')
+        """Försök hitta bild-URL i vilken str/dict/list som helst."""
         if isinstance(obj, str):
-            if "tpc.googlesyndication.com" in obj or obj.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            if obj.endswith((".png", ".jpg", ".jpeg", ".webp")):
                 return obj
             m = IMG_SRC_RE.search(obj)
             if m:
                 return m.group(1)
+            m2 = HTTP_URL_RE.search(obj)
+            if m2 and m2.group(0).endswith((".png", ".jpg", ".jpeg", ".webp")):
+                return m2.group(0)
         elif isinstance(obj, dict):
             for _v in obj.values():
                 res = scan_for_img(_v)
@@ -264,22 +285,29 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                     return res
         return None
 
-    def find_ads_in_obj(obj, source_file, out_list):
+    def find_ads_in_obj(obj, source_file: str, out_list: list[dict]):
         """
-        Går rekursivt igenom `obj` och om vi hittar dict med flera "annons-nycklar",
-        lägger vi till den som ad-kandidat.
+        Går rekursivt genom JSON och samlar dicts som ser ut som annonser:
+        - antingen har flera "vanliga" textnycklar,
+        - eller har flera av nummernycklarna 2,3,7,8,12.
         """
         if isinstance(obj, dict):
-            keys = set(obj.keys())
-            if len(keys & AD_KEYS) >= 2:
+            keys = {str(k) for k in obj.keys()}
+            has_text_keys = len(keys & AD_TEXT_KEYS) >= 2
+            has_numeric_pattern = len(keys & NUMERIC_KEYS) >= 3
+
+            if has_text_keys or has_numeric_pattern:
                 out_list.append({"source_file": source_file, "node": obj})
+
             for v in obj.values():
                 find_ads_in_obj(v, source_file, out_list)
+
         elif isinstance(obj, list):
             for item in obj:
                 find_ads_in_obj(item, source_file, out_list)
 
-    all_ads_nodes = []
+    # Bygg lista med alla annons-noder
+    all_ads_nodes: list[dict] = []
     for cand in candidates:
         src_file = cand.get("source_file", "")
         parsed = cand.get("parsed")
@@ -297,42 +325,45 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 
         # --- Plocka ut fält ---
         creative_id = (
-            entry.get("creativeId") or
-            entry.get("adId") or
-            entry.get("id") or
-            entry.get("2") or
-            ""
+            entry.get("creativeId")
+            or entry.get("adId")
+            or entry.get("id")
+            or entry.get("2")
+            or ""
         )
 
         advertiser = (
-            entry.get("advertiserName") or
-            entry.get("advertiser") or
-            entry.get("brandName") or
-            ""
+            entry.get("advertiserName")
+            or entry.get("advertiser")
+            or entry.get("brandName")
+            or entry.get("12")
+            or ""
         )
 
         headline = (
-            entry.get("headline") or
-            entry.get("headlineText") or
-            entry.get("title") or
-            entry.get("primaryText") or
-            ""
+            entry.get("headline")
+            or entry.get("headlineText")
+            or entry.get("title")
+            or entry.get("7")
+            or entry.get("primaryText")
+            or ""
         )
 
         description = (
-            entry.get("description") or
-            entry.get("bodyText") or
-            entry.get("secondaryText") or
-            entry.get("snippet") or
-            ""
+            entry.get("description")
+            or entry.get("bodyText")
+            or entry.get("secondaryText")
+            or entry.get("8")
+            or entry.get("snippet")
+            or ""
         )
 
         image_url = (
-            entry.get("imageUrl") or
-            entry.get("image_url") or
-            entry.get("thumbnailUrl") or
-            entry.get("thumbnail") or
-            ""
+            entry.get("imageUrl")
+            or entry.get("image_url")
+            or entry.get("thumbnailUrl")
+            or entry.get("thumbnail")
+            or ""
         )
 
         if not image_url:
@@ -363,38 +394,44 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 print(f"⚠️ kunde inte ladda ner bild ({image_url}): {e}")
                 image_file = ""
 
-        rows.append({
-            "SourceFile": src_file,
-            "CreativeID": creative_id,
-            "Annonsör": advertiser,
-            "Rubrik": headline,
-            "Beskrivning": description,
-            "Bild-URL": image_url or "",
-            "Bildfil": image_file
-        })
+        rows.append(
+            {
+                "SourceFile": src_file,
+                "CreativeID": creative_id,
+                "Annonsör": advertiser,
+                "Rubrik": headline,
+                "Beskrivning": description,
+                "Bild-URL": image_url or "",
+                "Bildfil": image_file,
+            }
+        )
         ads_count += 1
 
+    # Om vi trots allt inte hittade något, skapa ändå Excel så /result funkar
     if not rows:
         print("Hittade inga annonser i JSON. Skapar tom Excel.")
         excel_path = get_available_filename(OUTPUT_EXCEL)
-        df = pd.DataFrame([{
-            "Info": "Inga annonser hittades för detta AR-ID / tidsintervall."
-        }])
+        df = pd.DataFrame(
+            [{"Info": "Inga annonser hittades för detta AR-ID / tidsintervall."}]
+        )
         df.to_excel(excel_path, index=False)
         print(f"Tom Excel skapad: {excel_path}")
         return True
 
-    # ----- Skapa Excel -----
+    # ----- Skapa Excel med data -----
     excel_path = get_available_filename(OUTPUT_EXCEL)
-    df = pd.DataFrame(rows, columns=[
-        "SourceFile",
-        "CreativeID",
-        "Annonsör",
-        "Rubrik",
-        "Beskrivning",
-        "Bild-URL",
-        "Bildfil"
-    ])
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "SourceFile",
+            "CreativeID",
+            "Annonsör",
+            "Rubrik",
+            "Beskrivning",
+            "Bild-URL",
+            "Bildfil",
+        ],
+    )
     df.to_excel(excel_path, index=False)
     print(f"📊 Grund-Excel (utan inbäddade bilder) sparad som: {excel_path}")
 
@@ -437,8 +474,11 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 if __name__ == "__main__":
     # Enkel CLI-test
     import argparse
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("ar_input", help="AR-ID eller full URL till Google Ads Transparency.")
+    parser.add_argument(
+        "ar_input", help="AR-ID eller full URL till Google Ads Transparency."
+    )
     parser.add_argument("--run_dir", default="test_run", help="Output-katalog.")
     args = parser.parse_args()
 
