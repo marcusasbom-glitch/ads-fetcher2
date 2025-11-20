@@ -401,8 +401,15 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             ads_count += 1
 
     if not rows:
-        print("Hittade inga annonser i candidates.")
-        return False
+        print("Hittade inga annonser i candidates. Skapar tom Excel.")
+        excel_path = get_available_filename(OUTPUT_EXCEL)
+        # Skapa ett enkelt ark med ett meddelande
+        df = pd.DataFrame([{
+            "Info": "Inga annonser hittades för detta AR-ID / tidsintervall."
+        }])
+        df.to_excel(excel_path, index=False)
+        print(f"Tom Excel skapad: {excel_path}")
+        return True
 
     excel_path = get_available_filename(OUTPUT_EXCEL)
     df = pd.DataFrame(rows, columns=[
@@ -413,6 +420,8 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         "Beskrivning",
         "Bild-URL",
         "Bildfil"
+    ])
+
     ])
     df.to_excel(excel_path, index=False)
     print(f"📊 Grund-Excel (utan inbäddade bilder) sparad som: {excel_path}")
@@ -470,3 +479,4 @@ if __name__ == "__main__":
             process_candidates_and_save(args.run_dir)
 
     asyncio.run(main())
+
