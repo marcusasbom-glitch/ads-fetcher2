@@ -74,8 +74,8 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
     Kör Playwright, fångar nätverkstrafik och skriver responses till OUTPUT_DIR.
     Skapar ads_candidates.json med JSON vi senare skannar efter annonser.
 
-    Viktigt: här försöker vi identifiera JSON baserat på *innehållet* i body,
-    inte bara på Content-Type, eftersom Google ofta skickar JSON som text/html.
+    Viktigt: vi letar efter JSON / JSON+protobuf baserat på *Content-Type*,
+    inte bara domännamn, så att vi får med t.ex. ogads-pa.clients6.google.com.
     """
     set_paths(run_dir)
 
@@ -114,50 +114,46 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                     "content_type": ct,
                 }
 
-                # Vi bryr oss huvudsakligen om requests till adstransparency.google.com
-                if "adstransparency.google.com" not in r_url:
-                    responses_meta.append(meta)
-                    return
+                # Vi är intresserade av alla svar som verkar vara JSON-aktiga
+                # (json, json+protobuf, etc.) – oavsett domän.
+                looks_jsonish_ct = "json" in ct or "protobuf" in ct
 
-                # Hämta body (begränsa storlek lite för säkerhets skull)
-                try:
-                    body = await response.body()
-                except Exception as e:
-                    meta["body_error"] = f"body_error: {e}"
-                    responses_meta.append(meta)
-                    return
+                if looks_jsonish_ct:
+                    try:
+                        body = await response.body()
+                    except Exception as e:
+                        meta["body_error"] = f"body_error: {e}"
+                        responses_meta.append(meta)
+                        return
 
-                if not body or len(body) > 5_000_000:
-                    responses_meta.append(meta)
-                    return
+                    if not body or len(body) > 5_000_000:
+                        responses_meta.append(meta)
+                        return
 
-                try:
-                    txt = body.decode("utf-8", errors="ignore")
-                except Exception:
-                    # om vi inte ens kan dekoda som text – skippa
-                    responses_meta.append(meta)
-                    return
+                    try:
+                        txt = body.decode("utf-8", errors="ignore")
+                    except Exception:
+                        responses_meta.append(meta)
+                        return
 
-                trimmed = txt.lstrip()
-                # Google har ofta prefix: )]}'
-                if trimmed.startswith(")]}'"):
-                    trimmed_json = trimmed[4:].lstrip()
-                else:
-                    trimmed_json = trimmed
+                    trimmed = txt.lstrip()
+                    if trimmed.startswith(")]}'"):
+                        trimmed_json = trimmed[4:].lstrip()
+                    else:
+                        trimmed_json = trimmed
 
-                is_jsonish = trimmed_json.startswith("{") or trimmed_json.startswith("[")
-                should_save = "application/json" in ct or is_jsonish
+                    is_jsonish = trimmed_json.startswith("{") or trimmed_json.startswith("[")
+                    if not is_jsonish:
+                        # ser inte ut som JSON – skippa
+                        responses_meta.append(meta)
+                        return
 
-                if should_save:
                     safe_name = sanitize_filename(r_url)
                     if len(safe_name) > 80:
                         safe_name = safe_name[-80:]
                     base_name = f"{int(time.time()*1000)}_{safe_name}"
-
-                    # spara rå text som .json – vi har redan strippat prefix
-                    out_txt = trimmed_json
                     (OUTPUT_DIR / (base_name + ".json")).write_text(
-                        out_txt, encoding="utf-8"
+                        trimmed_json, encoding="utf-8"
                     )
                     meta["saved"] = base_name + ".json"
 
@@ -193,11 +189,14 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
             f"{OUTPUT_DIR / 'responses_index.json'}"
         )
 
-        # läs alla json-filer och lägg dem som kandidater
+        # läs alla json-filer (förutom responses_index.json) och lägg dem som kandidater
         ad_candidates = []
         json_files = sorted(OUTPUT_DIR.glob("*.json"))
         print(f"🗂️ Hittade {len(json_files)} .json-filer i {OUTPUT_DIR}")
         for f in json_files:
+            if f.name == "responses_index.json":
+                # indexet är bara metadata, inte själva annonspayloaden
+                continue
             try:
                 txt = f.read_text(encoding="utf-8")
                 parsed = json.loads(txt)
@@ -222,7 +221,8 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     """
     Läser ads_candidates.json, letar rekursivt efter annons-objekt,
-    laddar ner bilder och skapar en Excel med metadata + inbäddade bilder.
+    laddar ned bilder och skapar en Excel med metadata + inbäddade bilder.
+    Om inga annonser hittas: dumpa alla strängar i JSON till Excel (debug-läge).
     """
     set_paths(run_dir)
 
@@ -241,7 +241,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     session.headers.update({"User-Agent": "Mozilla/5.0"})
     ads_count = 0
 
-    # Nycklar som brukar finnas i "text-baserade" annonsobjekt
+    # Nycklar som brukar finnas i text-baserade annonsobjekt
     AD_TEXT_KEYS = {
         "advertiserName",
         "advertiser",
@@ -263,7 +263,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         "secondaryText",
     }
 
-    # Google-nummernycklar som ofta används i dessa protobuff-liknande JSON:er
+    # Google-nummernycklar som ofta används i protobuff-liknande JSON
     NUMERIC_KEYS = {"2", "3", "7", "8", "12"}
 
     IMG_SRC_RE = re.compile(
@@ -324,6 +324,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 
     print(f"🕵️ Hittade totalt {len(all_ads_nodes)} potentiella annons-objekt i JSON.")
 
+    # ----- Första försök: "riktig" annons-extraktion -----
     for ad in all_ads_nodes:
         if ads_count >= MAX_ADS:
             print(f"⏹️ Avbryter efter MAX_ADS={MAX_ADS} annonser.")
@@ -332,7 +333,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         src_file = ad["source_file"]
         entry = ad["node"]
 
-        # --- Plocka ut fält ---
         creative_id = (
             entry.get("creativeId")
             or entry.get("adId")
@@ -416,18 +416,57 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         )
         ads_count += 1
 
-    # Om vi trots allt inte hittade något, skapa ändå Excel så /result funkar
+    # ----- FALLBACK: dumpa hela JSON platt om vi inte hittade annonser -----
     if not rows:
-        print("Hittade inga annonser i JSON. Skapar tom Excel.")
+        print("Hittade inga annonser enligt heuristiken – skapar JSON-dump istället.")
+
+        flat_rows: list[dict] = []
+        MAX_FLAT_ROWS = 5000  # skydd så vi inte gör gigantisk fil
+
+        def flatten(obj, source_file: str, path: str):
+            nonlocal flat_rows
+            if len(flat_rows) >= MAX_FLAT_ROWS:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    new_path = f"{path}.{k}" if path else str(k)
+                    flatten(v, source_file, new_path)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    new_path = f"{path}[{i}]" if path else f"[{i}]"
+                    flatten(v, source_file, new_path)
+            else:
+                if isinstance(obj, str):
+                    val = obj.strip()
+                    if val:
+                        flat_rows.append(
+                            {
+                                "SourceFile": source_file,
+                                "Path": path,
+                                "Value": val,
+                            }
+                        )
+
+        for cand in candidates:
+            src_file = cand.get("source_file", "")
+            parsed = cand.get("parsed")
+            flatten(parsed, src_file, "")
+
+        print(f"JSON-dump: la till {len(flat_rows)} sträng-värden i flat_rows.")
+
         excel_path = get_available_filename(OUTPUT_EXCEL)
-        df = pd.DataFrame(
-            [{"Info": "Inga annonser hittades för detta AR-ID / tidsintervall."}]
-        )
+        if not flat_rows:
+            df = pd.DataFrame(
+                [{"Info": "Kunde inte hitta några textsträngar i JSON heller."}]
+            )
+        else:
+            df = pd.DataFrame(flat_rows, columns=["SourceFile", "Path", "Value"])
+
         df.to_excel(excel_path, index=False)
-        print(f"Tom Excel skapad: {excel_path}")
+        print(f"📄 JSON-dump Excel skapad: {excel_path}")
         return True
 
-    # ----- Skapa Excel med data -----
+    # ----- Skapa Excel med annons-data -----
     excel_path = get_available_filename(OUTPUT_EXCEL)
     df = pd.DataFrame(
         rows,
