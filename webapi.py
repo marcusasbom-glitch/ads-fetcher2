@@ -134,6 +134,17 @@ async def run_job(ar_input: str = Form(...)):
 
     write_status(job_dir, status="queued", progress=0, message="Köar jobb…")
     append_log(job_dir, f"JOB CREATED med ar_input={ar_input}")
+# DEBUG: visa JSON-kandidater i loggen
+try:
+    cand_path = job_dir / "ads_candidates.json"
+    if cand_path.exists():
+        import json
+        data = json.loads(cand_path.read_text(encoding="utf-8"))
+        print("==== DEBUG JSON DUMP START ====")
+        print(json.dumps(data, indent=2, ensure_ascii=False)[:20000])  # max 20k tecken
+        print("==== DEBUG JSON DUMP END ====")
+except Exception as e:
+    print("DEBUG JSON error:", e)
 
     # Starta bakgrunds-task
     asyncio.create_task(do_job(job_id, ar_input))
