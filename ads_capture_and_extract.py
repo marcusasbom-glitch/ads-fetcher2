@@ -74,7 +74,7 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
     Kör Playwright, fångar nätverkstrafik och skriver responses till OUTPUT_DIR.
     Skapar ads_candidates.json med JSON vi senare skannar efter annonser.
 
-    Viktigt: vi letar efter JSON / JSON+protobuf baserat på *Content-Type*,
+    Viktigt: vi letar efter JSON / JSON+protobuf baserat på Content-Type,
     inte bara domännamn, så att vi får med t.ex. ogads-pa.clients6.google.com.
     """
     set_paths(run_dir)
@@ -115,7 +115,6 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
                 }
 
                 # Vi är intresserade av alla svar som verkar vara JSON-aktiga
-                # (json, json+protobuf, etc.) – oavsett domän.
                 looks_jsonish_ct = "json" in ct or "protobuf" in ct
 
                 if looks_jsonish_ct:
@@ -144,7 +143,6 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 
                     is_jsonish = trimmed_json.startswith("{") or trimmed_json.startswith("[")
                     if not is_jsonish:
-                        # ser inte ut som JSON – skippa
                         responses_meta.append(meta)
                         return
 
@@ -195,7 +193,6 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
         print(f"🗂️ Hittade {len(json_files)} .json-filer i {OUTPUT_DIR}")
         for f in json_files:
             if f.name == "responses_index.json":
-                # indexet är bara metadata, inte själva annonspayloaden
                 continue
             try:
                 txt = f.read_text(encoding="utf-8")
@@ -222,7 +219,11 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     """
     Läser ads_candidates.json, letar rekursivt efter annons-objekt,
     laddar ned bilder och skapar en Excel med metadata + inbäddade bilder.
-    Om inga annonser hittas: dumpa alla strängar i JSON till Excel (debug-läge).
+
+    Om inga annonser hittas:
+      - platta ut HELA JSON till rader (SourceFile, Path, Value)
+      - känn igen bild-URL:er
+      - ladda ned och bädda in bilder i samma ark
     """
     set_paths(run_dir)
 
@@ -266,9 +267,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     # Google-nummernycklar som ofta används i protobuff-liknande JSON
     NUMERIC_KEYS = {"2", "3", "7", "8", "12"}
 
-    IMG_SRC_RE = re.compile(
-        r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE
-    )
+    IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
     HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
     def scan_for_img(obj):
@@ -315,7 +314,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             for item in obj:
                 find_ads_in_obj(item, source_file, out_list)
 
-    # Bygg lista med alla annons-noder
+    # ---- Försök 1: hitta riktiga annons-noder ----
     all_ads_nodes: list[dict] = []
     for cand in candidates:
         src_file = cand.get("source_file", "")
@@ -324,7 +323,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 
     print(f"🕵️ Hittade totalt {len(all_ads_nodes)} potentiella annons-objekt i JSON.")
 
-    # ----- Första försök: "riktig" annons-extraktion -----
     for ad in all_ads_nodes:
         if ads_count >= MAX_ADS:
             print(f"⏹️ Avbryter efter MAX_ADS={MAX_ADS} annonser.")
@@ -416,9 +414,9 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         )
         ads_count += 1
 
-    # ----- FALLBACK: dumpa hela JSON platt om vi inte hittade annonser -----
+    # ---- FALLBACK: platta ut all JSON + bilder ----
     if not rows:
-        print("Hittade inga annonser enligt heuristiken – skapar JSON-dump istället.")
+        print("Hittade inga annonser enligt heuristiken – skapar JSON-dump med bilder istället.")
 
         flat_rows: list[dict] = []
         MAX_FLAT_ROWS = 5000  # skydd så vi inte gör gigantisk fil
@@ -427,6 +425,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             nonlocal flat_rows
             if len(flat_rows) >= MAX_FLAT_ROWS:
                 return
+
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     new_path = f"{path}.{k}" if path else str(k)
@@ -438,35 +437,104 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             else:
                 if isinstance(obj, str):
                     val = obj.strip()
-                    if val:
-                        flat_rows.append(
-                            {
-                                "SourceFile": source_file,
-                                "Path": path,
-                                "Value": val,
-                            }
-                        )
+                    if not val:
+                        return
+
+                    row = {
+                        "SourceFile": source_file,
+                        "Path": path,
+                        "Value": val,
+                        "ImageURL": "",
+                        "ImageFile": "",
+                    }
+
+                    # Bild-URL?
+                    if val.lower().startswith("http") and any(
+                        val.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")
+                    ):
+                        row["ImageURL"] = val
+                        if DOWNLOAD_IMAGES:
+                            try:
+                                img_url = val
+                                if img_url.startswith("//"):
+                                    img_url = "https:" + img_url
+                                r = session.get(img_url, timeout=10, stream=True)
+                                if r.status_code == 200:
+                                    ext = "png"
+                                    ct = r.headers.get("content-type", "").lower()
+                                    if "jpeg" in ct or "jpg" in ct:
+                                        ext = "jpg"
+                                    elif "png" in ct:
+                                        ext = "png"
+                                    elif "webp" in ct:
+                                        ext = "webp"
+                                    filename = f"flat_{len(flat_rows)+1}.{ext}"
+                                    file_path = IMAGES_DIR / filename
+                                    with open(file_path, "wb") as wf:
+                                        for chunk in r.iter_content(1024):
+                                            wf.write(chunk)
+                                    row["ImageFile"] = str(file_path)
+                            except Exception as e:
+                                print(f"⚠️ kunde inte ladda ner bild (flat) {val}: {e}")
+
+                    flat_rows.append(row)
 
         for cand in candidates:
             src_file = cand.get("source_file", "")
             parsed = cand.get("parsed")
             flatten(parsed, src_file, "")
 
-        print(f"JSON-dump: la till {len(flat_rows)} sträng-värden i flat_rows.")
+        print(f"JSON-dump: la till {len(flat_rows)} rader (text + ev. bilder).")
 
         excel_path = get_available_filename(OUTPUT_EXCEL)
         if not flat_rows:
             df = pd.DataFrame(
                 [{"Info": "Kunde inte hitta några textsträngar i JSON heller."}]
             )
-        else:
-            df = pd.DataFrame(flat_rows, columns=["SourceFile", "Path", "Value"])
+            df.to_excel(excel_path, index=False)
+            print(f"📄 JSON-dump Excel (ingen data) skapad: {excel_path}")
+            return True
 
+        df = pd.DataFrame(flat_rows, columns=["SourceFile", "Path", "Value", "ImageURL", "ImageFile"])
         df.to_excel(excel_path, index=False)
         print(f"📄 JSON-dump Excel skapad: {excel_path}")
+
+        # Bädda in bilder i kolumn E ("ImageFile")
+        wb = load_workbook(excel_path)
+        ws = wb.active
+
+        for idx, row in enumerate(flat_rows, start=2):
+            img_path = row.get("ImageFile")
+            if img_path and Path(img_path).exists():
+                try:
+                    img = Image.open(img_path)
+                    max_w, max_h = 200, 200
+                    w, h = img.size
+                    scale = min(max_w / w, max_h / h, 1.0)
+                    if scale < 1.0:
+                        img = img.resize((int(w * scale), int(h * scale)))
+                    bio = BytesIO()
+                    img.save(bio, format="PNG")
+                    bio.seek(0)
+
+                    xlimg = XLImage(bio)
+                    xlimg.width = 120
+                    xlimg.height = 90
+                    ws.add_image(xlimg, f"E{idx}")
+                    ws.row_dimensions[idx].height = 80
+                except Exception as e:
+                    print(f"Fel vid inbäddning av flat-bild för rad {idx}: {e}")
+
+        for i, col in enumerate(df.columns, start=1):
+            col_letter = get_column_letter(i)
+            maxlen = max((len(str(x)) for x in df[col]), default=len(col))
+            ws.column_dimensions[col_letter].width = min(maxlen + 8, 80)
+
+        wb.save(excel_path)
+        print(f"✅ JSON-dump Excel med inbäddade bilder sparad som: {excel_path}")
         return True
 
-    # ----- Skapa Excel med annons-data -----
+    # ---- Normalt flöde: vi hittade annons-rader i `rows` ----
     excel_path = get_available_filename(OUTPUT_EXCEL)
     df = pd.DataFrame(
         rows,
@@ -483,7 +551,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     df.to_excel(excel_path, index=False)
     print(f"📊 Grund-Excel (utan inbäddade bilder) sparad som: {excel_path}")
 
-    # ----- Bädda in bilder -----
+    # Bädda in bilder i kolumn "Bildfil"
     wb = load_workbook(excel_path)
     ws = wb.active
 
@@ -504,7 +572,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 xlimg = XLImage(bio)
                 xlimg.width = 120
                 xlimg.height = 90
-                ws.add_image(xlimg, f"G{idx}")
+                ws.add_image(xlimg, f"G{idx}")  # kolumn G = Bildfil
                 ws.row_dimensions[idx].height = 80
             except Exception as e:
                 print(f"Fel vid inbäddning av bild för rad {idx}: {e}")
