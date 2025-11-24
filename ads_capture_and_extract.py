@@ -1,4 +1,4 @@
-# ads_capture_and_extract.py – IFRAMES VERSION (felsäker, inga f-strings i JS)
+# ads_capture_and_extract.py – IFRAMES + största-bilden-heuristik
 
 import asyncio
 import json
@@ -14,7 +14,6 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from playwright.async_api import async_playwright
 
-
 # ============================================================
 # Dynamiska paths (Render skapar en unik run-mapp per jobb)
 # ============================================================
@@ -24,7 +23,8 @@ CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
-MAX_ADS = int(os.getenv("MAX_ADS", "300"))
+# standard: hämta upp till 1000 annonser
+MAX_ADS = int(os.getenv("MAX_ADS", "1000"))
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
 
 
@@ -70,6 +70,7 @@ def get_available_filename(base):
 # PLAYWRIGHT – DOM scraping i ALLA FRAMES
 # ============================================================
 
+# JavaScript-kod som körs inne i varje frame (ingen f-string, ren literal)
 IFRAME_JS_SCRAPER = """
 () => {
     const cards = [];
@@ -82,13 +83,28 @@ IFRAME_JS_SCRAPER = """
         const txt = (el.innerText || "").toLowerCase();
         if (!txt) return false;
 
-        const hasImg = el.querySelector("img");
-        if (!hasImg) return false;
+        const imgNodes = Array.from(el.querySelectorAll("img"));
+        if (!imgNodes.length) return false;
 
-        if (txt.includes("sponsrad") || txt.includes("sponsored"))
+        // räkna ut bildstorlekar
+        const imgInfos = imgNodes.map(i => {
+            const w = i.naturalWidth || i.width || 0;
+            const h = i.naturalHeight || i.height || 0;
+            return { src: i.src, w: w, h: h, area: w * h };
+        });
+
+        // kräver minst en "stor" bild (>= 100x100 ≈ area 10 000)
+        const hasBig = imgInfos.some(info => info.area >= 10000);
+        if (!hasBig) return false;
+
+        // bonus-signal: "sponsrad"/"sponsored"
+        if (txt.includes("sponsrad") || txt.includes("sponsored")) {
             return true;
+        }
 
-        return txt.split("\\n").filter(x => x.trim()).length >= 3;
+        // annars: hyfsat mycket text
+        const lineCount = txt.split("\\n").filter(x => x.trim()).length;
+        return lineCount >= 3;
     };
 
     for (const el of elements) {
@@ -97,11 +113,15 @@ IFRAME_JS_SCRAPER = """
         const text = (el.innerText || "").trim();
         if (!text) continue;
 
-        const imgs = Array.from(el.querySelectorAll("img"))
-            .map(i => i.src)
-            .filter(Boolean);
+        const imgNodes = Array.from(el.querySelectorAll("img"));
+        const imgInfos = imgNodes.map(i => {
+            const w = i.naturalWidth || i.width || 0;
+            const h = i.naturalHeight || i.height || 0;
+            return { src: i.src, w: w, h: h, area: w * h };
+        });
 
-        if (!imgs.length) continue;
+        const bigImgs = imgInfos.filter(info => info.area >= 10000);
+        if (!bigImgs.length) continue;
 
         let headNode =
             el.querySelector("h1, h2, h3, h4") ||
@@ -117,7 +137,7 @@ IFRAME_JS_SCRAPER = """
             advertiser: advertiser,
             headline: headline,
             text: text,
-            image_urls: imgs
+            image_infos: imgInfos
         });
     }
 
@@ -157,27 +177,35 @@ async def capture_network(ar_input, run_dir):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(0.6)
 
-        # Hämta annonser i main frame
-        dom_ads = await page.evaluate(IFRAME_JS_SCRAPER)
-        print(f"🧩 Huvud-frame: {len(dom_ads)} annonser")
+        all_ads = []
 
-        # Hämta från iframes
+        # Huvud-frame
+        try:
+            main_ads = await page.evaluate(IFRAME_JS_SCRAPER)
+            print(f"🧩 Huvud-frame: {len(main_ads)} annonskort")
+            all_ads.extend(main_ads)
+        except Exception as e:
+            print("Fel vid DOM-scrape i huvud-frame:", e)
+
+        # Alla övriga frames
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
             try:
                 frame_ads = await frame.evaluate(IFRAME_JS_SCRAPER)
-                print(f"🪟 Frame {frame.url} → {len(frame_ads)} annonser")
-                dom_ads.extend(frame_ads)
-            except Exception:
-                print("⚠️ Frame ej läsbar (cross-origin):", frame.url)
+                print(f"🪟 Frame {frame.url} → {len(frame_ads)} annonskort")
+                all_ads.extend(frame_ads)
+            except Exception as e:
+                print("⚠️ Frame ej läsbar (cross-origin):", frame.url, e)
 
-        print("✅ TOTALT hittade annonser:", len(dom_ads))
+        print("✅ TOTALT hittade annonskort:", len(all_ads))
 
-        # Spara
         OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
         CANDIDATES_PATH.write_text(
-            json.dumps([{"source_file": "frames", "parsed": dom_ads}], indent=2, ensure_ascii=False),
+            json.dumps(
+                [{"source_file": "frames_dom", "parsed": all_ads}],
+                indent=2, ensure_ascii=False
+            ),
             encoding="utf-8"
         )
 
@@ -197,12 +225,14 @@ def process_candidates_and_save(run_dir):
         return False
 
     data = json.loads(CANDIDATES_PATH.read_text(encoding="utf-8"))
+    if not data:
+        print("❌ Tomma kandidater")
+        return False
 
-    rows = []
-    ads = data[0]["parsed"]
-
+    ads = data[0].get("parsed") or []
     print("⏳ Bearbetar annonser:", len(ads))
 
+    rows = []
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
@@ -210,30 +240,44 @@ def process_candidates_and_save(run_dir):
         if idx > MAX_ADS:
             break
 
-        img_url = ad["image_urls"][0] if ad["image_urls"] else ""
+        infos = ad.get("image_infos") or []
+        # välj största bild (area)
+        best = None
+        best_area = 0
+        for info in infos:
+            try:
+                area = int(info.get("area") or 0)
+            except Exception:
+                area = 0
+            if area > best_area:
+                best_area = area
+                best = info
+
+        img_url = best["src"] if best and best.get("src") else ""
         img_file = ""
 
-        # Ladda ned bild
         if img_url and DOWNLOAD_IMAGES:
             try:
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
+                url = img_url
+                if url.startswith("//"):
+                    url = "https:" + url
 
-                r = session.get(img_url, timeout=10)
+                r = session.get(url, timeout=10)
                 if r.status_code == 200:
-                    ct = r.headers.get("content-type", "")
+                    ct = (r.headers.get("content-type") or "").lower()
                     ext = "png"
-                    if "jpg" in ct:
+                    if "jpg" in ct or "jpeg" in ct:
                         ext = "jpg"
-                    if "webp" in ct:
+                    elif "webp" in ct:
                         ext = "webp"
 
                     fname = sanitize_filename(f"ad_{idx}.{ext}")
                     path = IMAGES_DIR / fname
                     path.write_bytes(r.content)
                     img_file = str(path)
-            except Exception:
-                pass
+            except Exception as e:
+                print("⚠️ kunde inte ladda ner bild:", img_url, e)
+                img_file = ""
 
         rows.append({
             "Index": idx,
@@ -248,11 +292,13 @@ def process_candidates_and_save(run_dir):
         df = pd.DataFrame([{"Info": "Inga annonser hittades"}])
         excel = get_available_filename(OUTPUT_EXCEL)
         df.to_excel(excel, index=False)
+        print("📄 Excel utan annonser:", excel)
         return True
 
     df = pd.DataFrame(rows)
     excel = get_available_filename(OUTPUT_EXCEL)
     df.to_excel(excel, index=False)
+    print("📊 Grund-Excel sparad:", excel)
 
     # Bädda in bilder
     wb = load_workbook(excel)
@@ -266,19 +312,28 @@ def process_candidates_and_save(run_dir):
         try:
             img = Image.open(f)
             w, h = img.size
-            scale = min(150 / w, 150 / h, 1)
-            img = img.resize((int(w * scale), int(h * scale)))
+            scale = min(200 / w, 200 / h, 1.0)
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)))
 
             bio = BytesIO()
             img.save(bio, format="PNG")
             bio.seek(0)
 
             xlimg = XLImage(bio)
-            ws.add_image(xlimg, f"F{r}")
-            ws.row_dimensions[r].height = 120
-        except Exception:
-            pass
+            xlimg.width = 140
+            xlimg.height = 140
+            ws.add_image(xlimg, f"F{r}")  # kolumn F = Bildfil
+            ws.row_dimensions[r].height = 110
+        except Exception as e:
+            print("Fel vid inbäddning av bild på rad", r, ":", e)
+
+    # snygga kolumner
+    for i, col in enumerate(df.columns, start=1):
+        col_letter = get_column_letter(i)
+        maxlen = max((len(str(x)) for x in df[col]), default=len(col))
+        ws.column_dimensions[col_letter].width = min(maxlen + 6, 80)
 
     wb.save(excel)
-    print("📄 Excel skapad:", excel)
+    print("✅ Excel med inbäddade bilder:", excel)
     return True
