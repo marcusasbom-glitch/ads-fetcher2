@@ -1,5 +1,5 @@
 # ads_capture_and_extract.py
-# Ny version: skrapar annonser direkt från sidan (DOM) i stället för nätverks-JSON.
+# Ny version: väldigt generös DOM-scrape av alla bilder + texter.
 
 import asyncio
 import os
@@ -21,7 +21,7 @@ CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
-MAX_ADS = int(os.getenv("MAX_ADS", "300"))
+MAX_ADS = int(os.getenv("MAX_ADS", "700"))  # tillåt fler ads
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
 
 
@@ -64,12 +64,13 @@ def get_available_filename(base: str) -> str:
     return str(p)
 
 
-# ---------- Playwright: hämta DOM-annonser ----------
+# ---------- Playwright: hämta alla bilder + text från DOM ----------
 
 async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> bool:
     """
-    Öppnar Google Ads Transparency-sidan, scrollar lite och plockar ut annonskort direkt
-    från DOM:en (text + bild-URL:er). Sparar som ads_candidates.json.
+    Öppnar Google Ads Transparency-sidan, scrollar och plockar ut ALLA <img>-taggar
+    med HTTP/HTTPS-URL, tillsammans med texten i deras närmaste container.
+    Sparar som ads_candidates.json.
     """
     set_paths(run_dir)
 
@@ -96,76 +97,75 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
         except Exception as e:
             print("⚠️ page.goto error:", e)
 
-        # Scrolla några gånger för att trigga lazy loads
-        for _ in range(8):
+        # Scrolla rejält för att få så många annonser som möjligt
+        for _ in range(20):
             try:
                 await page.evaluate("window.scrollBy(0, window.innerHeight);")
             except Exception:
                 pass
             await asyncio.sleep(0.7)
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
 
-        # Plocka ut annonskort direkt från DOM
         dom_ads = await page.evaluate(
             """
             () => {
-              const cards = [];
-              const candidates = Array.from(document.querySelectorAll('article, div, section'));
+              const results = [];
+              const imgs = Array.from(document.querySelectorAll('img'));
 
-              const isLikelyAdCard = (el) => {
-                const text = (el.innerText || '').toLowerCase();
-                if (!text) return false;
-                // Sponsrad på svenska/engelska
-                if (!text.includes('sponsrad') && !text.includes('sponsored')) return false;
-                // ha åtminstone en bild
-                if (!el.querySelector('img')) return false;
-                return true;
+              const getTextFor = (el) => {
+                if (!el) return '';
+                const txt = (el.innerText || '').trim();
+                if (txt) return txt;
+                // försök en nivå upp
+                if (el.parentElement) {
+                  const t2 = (el.parentElement.innerText || '').trim();
+                  if (t2) return t2;
+                }
+                return '';
               };
 
-              for (const el of candidates) {
-                if (!isLikelyAdCard(el)) continue;
+              for (const img of imgs) {
+                const src = img.src || '';
+                if (!src) continue;
+                // hoppa över ikoner/data-URI osv
+                if (!src.startsWith('http') && !src.startsWith('//')) continue;
 
-                const text = (el.innerText || '').trim();
+                // hitta en "card"-container uppåt i DOM
+                let container = img.closest('article, section, li, div[role="listitem"], div');
+                const text = getTextFor(container) || (img.alt || '').trim();
                 if (!text) continue;
 
-                const imgs = Array.from(el.querySelectorAll('img'))
-                  .map(i => i.src)
-                  .filter(u => !!u);
-
-                if (!imgs.length) continue;
-
-                // rubrik = första h-taggen eller länk med större text
-                let headlineNode =
-                  el.querySelector('h1, h2, h3, h4') ||
-                  el.querySelector('a[role="heading"]') ||
-                  el.querySelector('a');
-
-                const headline = headlineNode ? (headlineNode.innerText || '').trim() : '';
-
-                // annonsör = försök hitta rad med företagsnamn (över rubriken brukar vara bra)
-                let advertiser = '';
+                // dela upp text på rader
                 const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
+                let advertiser = '';
+                let headline = '';
+
                 if (lines.length > 0) {
                   advertiser = lines[0];
                 }
+                if (lines.length > 1) {
+                  headline = lines[1];
+                }
 
-                cards.push({
+                results.push({
                   advertiser,
                   headline,
                   text,
-                  image_urls: imgs
+                  image_urls: [src]
                 });
               }
 
-              return cards;
+              return results;
             }
             """
         )
 
-        print(f"🧩 Hittade {len(dom_ads)} DOM-annonskort")
+        console_msg = f"🧩 DOM-scrape hittade {dom_ads.length || dom_ads.length === 0 ? dom_ads.length : 'okänt'} kort."
+        console.log?.(console_msg);
 
-        # Spara som "kandidater" i samma format som tidigare pipeline
+        print(f"🧩 DOM-scrape hittade {len(dom_ads)} bildkort")
+
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         dom_file = OUTPUT_DIR / "dom_ads.json"
         dom_file.write_text(json.dumps(dom_ads, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -185,7 +185,7 @@ async def capture_network(ar_input: str, run_dir: str | Path | None = None) -> b
 
 def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     """
-    Läser ads_candidates.json (DOM-annonser), laddar ned bilder och skapar
+    Läser ads_candidates.json (DOM-scrape), laddar ned bilder och skapar
     en Excel med metadata + inbäddade bilder.
     """
     set_paths(run_dir)
@@ -200,7 +200,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     with open(CANDIDATES_PATH, "r", encoding="utf-8") as f:
         candidates = json.load(f)
 
-    # Kandidater är en lista med ett objekt: {source_file: "dom_ads.json", parsed: [...]}
     if not candidates:
         print("Inga kandidater i ads_candidates.json.")
         return False
@@ -217,7 +216,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         if not isinstance(parsed, list):
             continue
 
-        for idx, ad in enumerate(parsed, start=1):
+        for ad in parsed:
             if ads_count >= MAX_ADS:
                 print(f"⏹️ Avbryter efter MAX_ADS={MAX_ADS} annonser.")
                 break
@@ -227,7 +226,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             text       = (ad.get("text") or "").strip()
             image_urls = ad.get("image_urls") or []
 
-            # välj första bild-URL om det finns flera
             image_url = image_urls[0] if image_urls else ""
 
             image_file = ""
@@ -270,7 +268,7 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
             ads_count += 1
 
     if not rows:
-        print("Det gick att läsa DOM, men inga annonskort hittades. Skapar enkel Excel.")
+        print("DOM-scrape gav 0 kort. Skapar enkel Excel.")
         excel_path = get_available_filename(OUTPUT_EXCEL)
         df = pd.DataFrame(
             [{"Info": "Inga annonser hittades (DOM-scrape gav 0 kort)."}]
@@ -279,7 +277,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
         print(f"📄 Excel skapad utan annonser: {excel_path}")
         return True
 
-    # ----- Skapa Excel med data -----
     excel_path = get_available_filename(OUTPUT_EXCEL)
     df = pd.DataFrame(
         rows,
@@ -296,11 +293,10 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
     df.to_excel(excel_path, index=False)
     print(f"📊 Grund-Excel (utan inbäddade bilder) sparad som: {excel_path}")
 
-    # ----- Bädda in bilder -----
     wb = load_workbook(excel_path)
     ws = wb.active
 
-    for idx, row in enumerate(rows, start=2):  # rad 2..n (1 = header)
+    for idx, row in enumerate(rows, start=2):  # rad 2..n
         img_path = row.get("Bildfil")
         if img_path and Path(img_path).exists():
             try:
@@ -317,7 +313,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
                 xlimg = XLImage(bio)
                 xlimg.width = 120
                 xlimg.height = 90
-                # kolumn G = "Bildfil"
                 ws.add_image(xlimg, f"G{idx}")
                 ws.row_dimensions[idx].height = 80
             except Exception as e:
@@ -334,7 +329,6 @@ def process_candidates_and_save(run_dir: str | Path | None = None) -> bool:
 
 
 if __name__ == "__main__":
-    # Enkel CLI-test
     import argparse
 
     parser = argparse.ArgumentParser()
