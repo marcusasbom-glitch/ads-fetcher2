@@ -1,4 +1,4 @@
-# ads_capture_and_extract.py – iframes + smart bildval + beskrivning
+# ads_capture_and_extract.py – iframes + scroll + snällare filter
 
 import asyncio
 import json
@@ -70,19 +70,19 @@ def get_available_filename(base):
 # PLAYWRIGHT – DOM scraping i ALLA FRAMES
 # ============================================================
 
+# JavaScript-kod som körs inne i varje frame
+# Vi kräver bara minst en "stor" bild, inga hårda textkrav.
 IFRAME_JS_SCRAPER = """
 () => {
     const cards = [];
     const root = document.body;
     if (!root) return cards;
 
-    const elements = root.querySelectorAll("article, div, section");
     const MIN_AREA = 10000; // 100x100
+    const elements = root.querySelectorAll("article, div, section");
 
     for (const el of elements) {
         const txt = (el.innerText || "").trim();
-        if (!txt) continue;
-
         const imgNodes = Array.from(el.querySelectorAll("img"));
         if (!imgNodes.length) continue;
 
@@ -106,13 +106,7 @@ IFRAME_JS_SCRAPER = """
         const hasBig = imgInfos.some(info => info.area >= MIN_AREA);
         if (!hasBig) continue;
 
-        const lower = txt.toLowerCase();
-        const lineList = txt.split("\\n").map(s => s.trim()).filter(Boolean);
-
-        // måste antingen ha "sponsrad"/"sponsored" ELLER ganska mycket text
-        if (!(lower.includes("sponsrad") || lower.includes("sponsored"))) {
-            if (lineList.length < 3) continue;
-        }
+        const lines = (txt || "").split("\\n").map(s => s.trim()).filter(Boolean);
 
         let headNode =
             el.querySelector("h1, h2, h3, h4") ||
@@ -120,17 +114,17 @@ IFRAME_JS_SCRAPER = """
             el.querySelector("a");
 
         let headline = headNode ? (headNode.innerText || "").trim() : "";
-        if (!headline && lineList.length > 1) {
-            headline = lineList[1];
+        if (!headline && lines.length > 1) {
+            headline = lines[1];
         }
 
-        const advertiser = lineList.length ? lineList[0] : "";
+        const advertiser = lines.length ? lines[0] : "";
 
         cards.push({
             advertiser: advertiser,
             headline: headline,
             text: txt,
-            lines: lineList,
+            lines: lines,
             image_infos: imgInfos
         });
     }
@@ -166,7 +160,7 @@ async def capture_network(ar_input, run_dir):
 
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-        # Scroll för lazy load
+        # Scroll i huvudsidan (om något laddas där)
         for _ in range(10):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(0.6)
@@ -181,11 +175,16 @@ async def capture_network(ar_input, run_dir):
         except Exception as e:
             print("Fel vid DOM-scrape i huvud-frame:", e)
 
-        # Alla övriga frames
+        # Alla övriga frames – scrolla och scrapa
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
             try:
+                # scrolla inne i iframen för att trigga lazy load
+                for _ in range(10):
+                    await frame.evaluate("window.scrollBy(0, window.innerHeight)")
+                    await asyncio.sleep(0.4)
+
                 frame_ads = await frame.evaluate(IFRAME_JS_SCRAPER)
                 print(f"🪟 Frame {frame.url} → {len(frame_ads)} annonskort")
                 all_ads.extend(frame_ads)
@@ -245,12 +244,15 @@ def process_candidates_and_save(run_dir):
         best = None
         best_score = -1
         for info in big:
-            area = float(info.get("area") or 0)
-            ratio = float(info.get("ratio") or 0)
-            # ge bonus till landskapsbilder (bredare än höga)
+            try:
+                area = float(info.get("area") or 0)
+                ratio = float(info.get("ratio") or 0)
+            except Exception:
+                area = 0.0
+                ratio = 0.0
             score = area
             if ratio > 1.2:
-                score *= 1.5
+                score *= 1.5  # bonus för landskap
             if score > best_score:
                 best_score = score
                 best = info
