@@ -25,8 +25,11 @@ IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
 # ta upp till 500 annonser
-MAX_ADS = int(os.getenv("MAX_ADS", "500"))
+MAX_ADS = int(os.getenv("MAX_ADS", "1000"))
+# hur många annonser som vi får köra OCR på (resten hoppar över OCR)
+MAX_OCR_ADS = int(os.getenv("MAX_OCR_ADS", "150"))
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
+
 
 
 def set_paths(base_dir):
@@ -380,4 +383,5 @@ def process_candidates_and_save(run_dir):
     wb.save(excel)
     print("✅ Excel med inbäddade bilder:", excel)
     return True
+
 
