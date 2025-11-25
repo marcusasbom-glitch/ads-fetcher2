@@ -131,7 +131,7 @@ async def do_job(job_id: str, ar_input: str):
             loop = asyncio.get_running_loop()
             await asyncio.wait_for(
                 loop.run_in_executor(None, process_candidates_and_save, job_dir),
-                timeout=6 * 60
+                timeout=15 * 60
             )
 
         await asyncio.wait_for(whole(), timeout=OVERALL_DEADLINE_SEC)
