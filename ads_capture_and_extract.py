@@ -314,9 +314,7 @@ def process_candidates_and_save(run_dir):
             description = " ".join(lines[2:])
         elif len(lines) == 2:
             description = lines[1]
-
-        # OCR-fallback om vi saknar rubrik + beskrivning men har bild
-                # kör bara OCR för de första MAX_OCR_ADS annonserna
+   # kör bara OCR för de första MAX_OCR_ADS annonserna
         do_ocr = (idx <= MAX_OCR_ADS)
 
         # OCR-fallback om vi saknar rubrik + beskrivning men har bild
@@ -389,6 +387,7 @@ def process_candidates_and_save(run_dir):
     wb.save(excel)
     print("✅ Excel med inbäddade bilder:", excel)
     return True
+
 
 
 
