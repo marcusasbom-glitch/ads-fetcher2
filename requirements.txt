@@ -8,3 +8,5 @@ Pillow
 jinja2
 boto3   # om du vill ladda upp Excel till S3
 python-multipart
+pytesseract
+
