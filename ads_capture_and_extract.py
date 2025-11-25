@@ -1,4 +1,4 @@
-# ads_capture_and_extract.py – iframes + scroll + snällare filter
+# ads_capture_and_extract.py – iframes + smart bildval + OCR från annonsbilder
 
 import asyncio
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+import pytesseract
 from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -66,12 +67,30 @@ def get_available_filename(base):
     return str(p)
 
 
+def ocr_image(path: str) -> str:
+    """Läs text ur en bild med Tesseract (svenska + engelska)."""
+    try:
+        img = Image.open(path)
+    except Exception as e:
+        print(f"⚠️ OCR: kunde inte öppna bild {path}: {e}")
+        return ""
+    try:
+        return pytesseract.image_to_string(img, lang="swe+eng")
+    except Exception as e:
+        print(f"⚠️ OCR swe+eng misslyckades ({path}): {e}")
+        try:
+            return pytesseract.image_to_string(img)
+        except Exception as e2:
+            print(f"⚠️ OCR utan språk misslyckades ({path}): {e2}")
+            return ""
+
+
 # ============================================================
 # PLAYWRIGHT – DOM scraping i ALLA FRAMES
 # ============================================================
 
 # JavaScript-kod som körs inne i varje frame
-# Vi kräver bara minst en "stor" bild, inga hårda textkrav.
+# Vi kräver minst en "stor" bild, och sparar alla textrader.
 IFRAME_JS_SCRAPER = """
 () => {
     const cards = [];
@@ -207,7 +226,7 @@ async def capture_network(ar_input, run_dir):
 
 
 # ============================================================
-# EXCEL + bildnedladdning
+# EXCEL + bildnedladdning + OCR
 # ============================================================
 
 def process_candidates_and_save(run_dir):
@@ -236,13 +255,12 @@ def process_candidates_and_save(run_dir):
         infos = ad.get("image_infos") or []
 
         # välj "bästa" bild:
-        # 1) bara bilder med area >= 10000
         big = [i for i in infos if (i.get("area") or 0) >= 10000]
         if not big:
             big = infos
 
         best = None
-        best_score = -1
+        best_score = -1.0
         for info in big:
             try:
                 area = float(info.get("area") or 0)
@@ -285,16 +303,28 @@ def process_candidates_and_save(run_dir):
 
         # bygg beskrivning från text-rader efter rubrik
         lines = ad.get("lines") or []
+        advertiser = ad.get("advertiser", "")
+        headline = ad.get("headline", "")
         description = ""
         if len(lines) >= 3:
             description = " ".join(lines[2:])
         elif len(lines) == 2:
             description = lines[1]
 
+        # OCR-fallback om vi saknar rubrik + beskrivning men har bild
+        if not headline.strip() and not description.strip() and img_file:
+            ocr_txt = ocr_image(img_file)
+            ocr_lines = [l.strip() for l in ocr_txt.splitlines() if l.strip()]
+            if ocr_lines:
+                if not headline.strip():
+                    headline = ocr_lines[0][:120]
+                if len(ocr_lines) > 1 and not description.strip():
+                    description = " ".join(ocr_lines[1:])[:500]
+
         rows.append({
             "Index": idx,
-            "Annonsör": ad.get("advertiser", ""),
-            "Rubrik": ad.get("headline", ""),
+            "Annonsör": advertiser,
+            "Rubrik": headline,
             "Beskrivning": description,
             "Text": ad.get("text", ""),
             "Bild-URL": img_url,
