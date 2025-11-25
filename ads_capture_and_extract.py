@@ -24,8 +24,8 @@ CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
-# ta upp till 1000 annonser
-MAX_ADS = int(os.getenv("MAX_ADS", "1000"))
+# ta upp till 500 annonser
+MAX_ADS = int(os.getenv("MAX_ADS", "500"))
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
 
 
@@ -380,3 +380,4 @@ def process_candidates_and_save(run_dir):
     wb.save(excel)
     print("✅ Excel med inbäddade bilder:", excel)
     return True
+
