@@ -315,7 +315,11 @@ def process_candidates_and_save(run_dir):
             description = lines[1]
 
         # OCR-fallback om vi saknar rubrik + beskrivning men har bild
-        if not headline.strip() and not description.strip() and img_file:
+                # kör bara OCR för de första MAX_OCR_ADS annonserna
+        do_ocr = (idx <= MAX_OCR_ADS)
+
+        # OCR-fallback om vi saknar rubrik + beskrivning men har bild
+        if do_ocr and not headline.strip() and not description.strip() and img_file:
             ocr_txt = ocr_image(img_file)
             ocr_lines = [l.strip() for l in ocr_txt.splitlines() if l.strip()]
             if ocr_lines:
@@ -323,6 +327,7 @@ def process_candidates_and_save(run_dir):
                     headline = ocr_lines[0][:120]
                 if len(ocr_lines) > 1 and not description.strip():
                     description = " ".join(ocr_lines[1:])[:500]
+
 
         rows.append({
             "Index": idx,
@@ -383,5 +388,6 @@ def process_candidates_and_save(run_dir):
     wb.save(excel)
     print("✅ Excel med inbäddade bilder:", excel)
     return True
+
 
 
