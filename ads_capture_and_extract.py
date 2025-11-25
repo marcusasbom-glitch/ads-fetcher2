@@ -1,4 +1,4 @@
-# ads_capture_and_extract.py – IFRAMES + största-bilden-heuristik
+# ads_capture_and_extract.py – iframes + smart bildval + beskrivning
 
 import asyncio
 import json
@@ -23,7 +23,7 @@ CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
-# standard: hämta upp till 1000 annonser
+# ta upp till 1000 annonser
 MAX_ADS = int(os.getenv("MAX_ADS", "1000"))
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
 
@@ -70,7 +70,6 @@ def get_available_filename(base):
 # PLAYWRIGHT – DOM scraping i ALLA FRAMES
 # ============================================================
 
-# JavaScript-kod som körs inne i varje frame (ingen f-string, ren literal)
 IFRAME_JS_SCRAPER = """
 () => {
     const cards = [];
@@ -78,65 +77,60 @@ IFRAME_JS_SCRAPER = """
     if (!root) return cards;
 
     const elements = root.querySelectorAll("article, div, section");
-
-    const isAd = (el) => {
-        const txt = (el.innerText || "").toLowerCase();
-        if (!txt) return false;
-
-        const imgNodes = Array.from(el.querySelectorAll("img"));
-        if (!imgNodes.length) return false;
-
-        // räkna ut bildstorlekar
-        const imgInfos = imgNodes.map(i => {
-            const w = i.naturalWidth || i.width || 0;
-            const h = i.naturalHeight || i.height || 0;
-            return { src: i.src, w: w, h: h, area: w * h };
-        });
-
-        // kräver minst en "stor" bild (>= 100x100 ≈ area 10 000)
-        const hasBig = imgInfos.some(info => info.area >= 10000);
-        if (!hasBig) return false;
-
-        // bonus-signal: "sponsrad"/"sponsored"
-        if (txt.includes("sponsrad") || txt.includes("sponsored")) {
-            return true;
-        }
-
-        // annars: hyfsat mycket text
-        const lineCount = txt.split("\\n").filter(x => x.trim()).length;
-        return lineCount >= 3;
-    };
+    const MIN_AREA = 10000; // 100x100
 
     for (const el of elements) {
-        if (!isAd(el)) continue;
-
-        const text = (el.innerText || "").trim();
-        if (!text) continue;
+        const txt = (el.innerText || "").trim();
+        if (!txt) continue;
 
         const imgNodes = Array.from(el.querySelectorAll("img"));
+        if (!imgNodes.length) continue;
+
         const imgInfos = imgNodes.map(i => {
-            const w = i.naturalWidth || i.width || 0;
-            const h = i.naturalHeight || i.height || 0;
-            return { src: i.src, w: w, h: h, area: w * h };
+            const rect = i.getBoundingClientRect();
+            const w = i.naturalWidth || i.width || rect.width || 0;
+            const h = i.naturalHeight || i.height || rect.height || 0;
+            const area = w * h;
+            const ratio = h > 0 ? (w / h) : 0;
+            return {
+                src: i.src,
+                w: w,
+                h: h,
+                area: area,
+                top: rect.top || 0,
+                left: rect.left || 0,
+                ratio: ratio
+            };
         });
 
-        const bigImgs = imgInfos.filter(info => info.area >= 10000);
-        if (!bigImgs.length) continue;
+        const hasBig = imgInfos.some(info => info.area >= MIN_AREA);
+        if (!hasBig) continue;
+
+        const lower = txt.toLowerCase();
+        const lineList = txt.split("\\n").map(s => s.trim()).filter(Boolean);
+
+        // måste antingen ha "sponsrad"/"sponsored" ELLER ganska mycket text
+        if (!(lower.includes("sponsrad") || lower.includes("sponsored"))) {
+            if (lineList.length < 3) continue;
+        }
 
         let headNode =
             el.querySelector("h1, h2, h3, h4") ||
             el.querySelector('a[role="heading"]') ||
             el.querySelector("a");
 
-        const headline = headNode ? (headNode.innerText || "").trim() : "";
+        let headline = headNode ? (headNode.innerText || "").trim() : "";
+        if (!headline && lineList.length > 1) {
+            headline = lineList[1];
+        }
 
-        const lines = text.split("\\n").map(x => x.trim()).filter(Boolean);
-        const advertiser = lines.length ? lines[0] : "";
+        const advertiser = lineList.length ? lineList[0] : "";
 
         cards.push({
             advertiser: advertiser,
             headline: headline,
-            text: text,
+            text: txt,
+            lines: lineList,
             image_infos: imgInfos
         });
     }
@@ -241,16 +235,24 @@ def process_candidates_and_save(run_dir):
             break
 
         infos = ad.get("image_infos") or []
-        # välj största bild (area)
+
+        # välj "bästa" bild:
+        # 1) bara bilder med area >= 10000
+        big = [i for i in infos if (i.get("area") or 0) >= 10000]
+        if not big:
+            big = infos
+
         best = None
-        best_area = 0
-        for info in infos:
-            try:
-                area = int(info.get("area") or 0)
-            except Exception:
-                area = 0
-            if area > best_area:
-                best_area = area
+        best_score = -1
+        for info in big:
+            area = float(info.get("area") or 0)
+            ratio = float(info.get("ratio") or 0)
+            # ge bonus till landskapsbilder (bredare än höga)
+            score = area
+            if ratio > 1.2:
+                score *= 1.5
+            if score > best_score:
+                best_score = score
                 best = info
 
         img_url = best["src"] if best and best.get("src") else ""
@@ -279,10 +281,19 @@ def process_candidates_and_save(run_dir):
                 print("⚠️ kunde inte ladda ner bild:", img_url, e)
                 img_file = ""
 
+        # bygg beskrivning från text-rader efter rubrik
+        lines = ad.get("lines") or []
+        description = ""
+        if len(lines) >= 3:
+            description = " ".join(lines[2:])
+        elif len(lines) == 2:
+            description = lines[1]
+
         rows.append({
             "Index": idx,
             "Annonsör": ad.get("advertiser", ""),
             "Rubrik": ad.get("headline", ""),
+            "Beskrivning": description,
             "Text": ad.get("text", ""),
             "Bild-URL": img_url,
             "Bildfil": img_file,
@@ -323,7 +334,7 @@ def process_candidates_and_save(run_dir):
             xlimg = XLImage(bio)
             xlimg.width = 140
             xlimg.height = 140
-            ws.add_image(xlimg, f"F{r}")  # kolumn F = Bildfil
+            ws.add_image(xlimg, f"G{r}")  # kolumn G = Bildfil
             ws.row_dimensions[r].height = 110
         except Exception as e:
             print("Fel vid inbäddning av bild på rad", r, ":", e)
