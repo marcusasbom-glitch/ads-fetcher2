@@ -1,18 +1,12 @@
-# ads_capture_and_extract.py – iframes + smart bildval + begränsad OCR/embedding
+# ads_capture_and_extract.py – snabb version utan OCR & utan inbäddade bilder
 
 import asyncio
 import json
 import os
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 import requests
-import pytesseract
-from PIL import Image
-from openpyxl import load_workbook
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.utils import get_column_letter
 from playwright.async_api import async_playwright
 
 # ============================================================
@@ -21,43 +15,27 @@ from playwright.async_api import async_playwright
 
 OUTPUT_DIR = Path("network_dump")
 CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
-IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
 # Totalt max antal annonser i Excel
 MAX_ADS = int(os.getenv("MAX_ADS", "700"))
-# Hur många annonser får "tung" behandling (bildnedladdning + inbäddning i Excel)
-MAX_RICH_ADS = int(os.getenv("MAX_RICH_ADS", "120"))
-# Hur många av dessa får OCR från bild
-MAX_OCR_ADS = int(os.getenv("MAX_OCR_ADS", "60"))
-
-DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
 
 
 def set_paths(base_dir):
     """Repoint global paths into the run dir."""
-    global OUTPUT_DIR, CANDIDATES_PATH, IMAGES_DIR, OUTPUT_EXCEL
+    global OUTPUT_DIR, CANDIDATES_PATH, OUTPUT_EXCEL
 
     base = Path(base_dir)
     OUTPUT_DIR = base / "network_dump"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     CANDIDATES_PATH = base / "ads_candidates.json"
-
-    IMAGES_DIR = base / "images"
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
     OUTPUT_EXCEL = str(base / "ads_extracted.xlsx")
 
 
 # ============================================================
-# Hygienfunktioner
+# Hjälpfunktioner
 # ============================================================
-
-def sanitize_filename(name):
-    import re
-    return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
-
 
 def get_available_filename(base):
     p = Path(base)
@@ -70,24 +48,6 @@ def get_available_filename(base):
         if not alt.exists():
             return str(alt)
     return str(p)
-
-
-def ocr_image(path: str) -> str:
-    """Läs text ur en bild med Tesseract (svenska + engelska)."""
-    try:
-        img = Image.open(path)
-    except Exception as e:
-        print(f"⚠️ OCR: kunde inte öppna bild {path}: {e}")
-        return ""
-    try:
-        return pytesseract.image_to_string(img, lang="swe+eng")
-    except Exception as e:
-        print(f"⚠️ OCR swe+eng misslyckades ({path}): {e}")
-        try:
-            return pytesseract.image_to_string(img)
-        except Exception as e2:
-            print(f"⚠️ OCR utan språk misslyckades ({path}): {e2}")
-            return ""
 
 
 # ============================================================
@@ -214,9 +174,9 @@ async def capture_network(ar_input, run_dir):
 
         print("✅ TOTALT hittade annonskort:", len(all_ads))
 
-        # klipp ner listan redan här till MAX_ADS * 2 (lite buffert)
-        if len(all_ads) > MAX_ADS * 2:
-            all_ads = all_ads[: MAX_ADS * 2]
+        # klipp ned till MAX_ADS om det behövs
+        if len(all_ads) > MAX_ADS:
+            all_ads = all_ads[: MAX_ADS]
 
         OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
         CANDIDATES_PATH.write_text(
@@ -232,7 +192,7 @@ async def capture_network(ar_input, run_dir):
 
 
 # ============================================================
-# EXCEL + bildnedladdning + begränsad OCR/embedding
+# EXCEL – enbart text + Bild-URL (ingen nerladdning, ingen OCR)
 # ============================================================
 
 def process_candidates_and_save(run_dir):
@@ -251,8 +211,6 @@ def process_candidates_and_save(run_dir):
     print("⏳ Bearbetar annonser (totalt):", len(ads))
 
     rows = []
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     for idx, ad in enumerate(ads, start=1):
         if idx > MAX_ADS:
@@ -260,14 +218,10 @@ def process_candidates_and_save(run_dir):
 
         infos = ad.get("image_infos") or []
 
-        # välj "bästa" bild:
-        big = [i for i in infos if (i.get("area") or 0) >= 10000]
-        if not big:
-            big = infos
-
+        # välj "bästa" bild-URL (störst, bonus för landskap)
         best = None
         best_score = -1.0
-        for info in big:
+        for info in infos:
             try:
                 area = float(info.get("area") or 0)
                 ratio = float(info.get("ratio") or 0)
@@ -276,41 +230,13 @@ def process_candidates_and_save(run_dir):
                 ratio = 0.0
             score = area
             if ratio > 1.2:
-                score *= 1.5  # bonus för landskap
+                score *= 1.5
             if score > best_score:
                 best_score = score
                 best = info
 
         img_url = best["src"] if best and best.get("src") else ""
-        img_file = ""
 
-        # Bara de första MAX_RICH_ADS annonserna får bildnedladdning
-        do_rich = (idx <= MAX_RICH_ADS)
-
-        if do_rich and img_url and DOWNLOAD_IMAGES:
-            try:
-                url = img_url
-                if url.startswith("//"):
-                    url = "https:" + url
-
-                r = session.get(url, timeout=10)
-                if r.status_code == 200:
-                    ct = (r.headers.get("content-type") or "").lower()
-                    ext = "png"
-                    if "jpg" in ct or "jpeg" in ct:
-                        ext = "jpg"
-                    elif "webp" in ct:
-                        ext = "webp"
-
-                    fname = sanitize_filename(f"ad_{idx}.{ext}")
-                    path = IMAGES_DIR / fname
-                    path.write_bytes(r.content)
-                    img_file = str(path)
-            except Exception as e:
-                print("⚠️ kunde inte ladda ner bild:", img_url, e)
-                img_file = ""
-
-        # bygg beskrivning från text-rader efter rubrik
         lines = ad.get("lines") or []
         advertiser = ad.get("advertiser", "")
         headline = ad.get("headline", "")
@@ -320,17 +246,6 @@ def process_candidates_and_save(run_dir):
         elif len(lines) == 2:
             description = lines[1]
 
-        # OCR-fallback för ett begränsat antal (MAX_OCR_ADS, och bara om vi laddat ner bilden)
-        do_ocr = do_rich and (idx <= MAX_OCR_ADS)
-        if do_ocr and not headline.strip() and not description.strip() and img_file:
-            ocr_txt = ocr_image(img_file)
-            ocr_lines = [l.strip() for l in ocr_txt.splitlines() if l.strip()]
-            if ocr_lines:
-                if not headline.strip():
-                    headline = ocr_lines[0][:120]
-                if len(ocr_lines) > 1 and not description.strip():
-                    description = " ".join(ocr_lines[1:])[:500]
-
         rows.append({
             "Index": idx,
             "Annonsör": advertiser,
@@ -338,7 +253,6 @@ def process_candidates_and_save(run_dir):
             "Beskrivning": description,
             "Text": ad.get("text", ""),
             "Bild-URL": img_url,
-            "Bildfil": img_file,
         })
 
     if not rows:
@@ -351,42 +265,5 @@ def process_candidates_and_save(run_dir):
     df = pd.DataFrame(rows)
     excel = get_available_filename(OUTPUT_EXCEL)
     df.to_excel(excel, index=False)
-    print("📊 Grund-Excel sparad:", excel)
-
-    # Bädda in bilder – bara för rader som faktiskt har Bildfil (dvs första MAX_RICH_ADS)
-    wb = load_workbook(excel)
-    ws = wb.active
-
-    for r, row in enumerate(rows, start=2):
-        f = row["Bildfil"]
-        if not f or not Path(f).exists():
-            continue  # denna rad får bara URL, ingen inbäddad bild
-
-        try:
-            img = Image.open(f)
-            w, h = img.size
-            scale = min(200 / w, 200 / h, 1.0)
-            if scale < 1.0:
-                img = img.resize((int(w * scale), int(h * scale)))
-
-            bio = BytesIO()
-            img.save(bio, format="PNG")
-            bio.seek(0)
-
-            xlimg = XLImage(bio)
-            xlimg.width = 140
-            xlimg.height = 140
-            ws.add_image(xlimg, f"G{r}")  # kolumn G = Bildfil
-            ws.row_dimensions[r].height = 110
-        except Exception as e:
-            print("Fel vid inbäddning av bild på rad", r, ":", e)
-
-    # snygga kolumner
-    for i, col in enumerate(df.columns, start=1):
-        col_letter = get_column_letter(i)
-        maxlen = max((len(str(x)) for x in df[col]), default=len(col))
-        ws.column_dimensions[col_letter].width = min(maxlen + 6, 80)
-
-    wb.save(excel)
-    print("✅ Excel med inbäddade bilder:", excel)
+    print("✅ Excel sparad:", excel)
     return True
