@@ -1,4 +1,4 @@
-# ads_capture_and_extract.py – iframes + smart bildval + OCR från annonsbilder
+# ads_capture_and_extract.py – iframes + smart bildval + begränsad OCR/embedding
 
 import asyncio
 import json
@@ -24,13 +24,14 @@ CANDIDATES_PATH = OUTPUT_DIR / "ads_candidates.json"
 IMAGES_DIR = Path("images")
 OUTPUT_EXCEL = "ads_extracted.xlsx"
 
-# ta upp till 500 annonser
-MAX_ADS = int(os.getenv("MAX_ADS", "1000"))
-# hur många annonser som vi får köra OCR på (resten hoppar över OCR)
+# Totalt max antal annonser i Excel
+MAX_ADS = int(os.getenv("MAX_ADS", "700"))
+# Hur många annonser får "tung" behandling (bildnedladdning + inbäddning i Excel)
+MAX_RICH_ADS = int(os.getenv("MAX_RICH_ADS", "120"))
+# Hur många av dessa får OCR från bild
 MAX_OCR_ADS = int(os.getenv("MAX_OCR_ADS", "60"))
+
 DOWNLOAD_IMAGES = os.getenv("DOWNLOAD_IMAGES", "1") not in ("0", "false", "False")
-
-
 
 
 def set_paths(base_dir):
@@ -93,8 +94,6 @@ def ocr_image(path: str) -> str:
 # PLAYWRIGHT – DOM scraping i ALLA FRAMES
 # ============================================================
 
-# JavaScript-kod som körs inne i varje frame
-# Vi kräver minst en "stor" bild, och sparar alla textrader.
 IFRAME_JS_SCRAPER = """
 () => {
     const cards = [];
@@ -183,10 +182,10 @@ async def capture_network(ar_input, run_dir):
 
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-        # Scroll i huvudsidan (om något laddas där)
-        for _ in range(10):
+        # Scroll i huvudsidan
+        for _ in range(8):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.5)
 
         all_ads = []
 
@@ -203,8 +202,7 @@ async def capture_network(ar_input, run_dir):
             if frame == page.main_frame:
                 continue
             try:
-                # scrolla inne i iframen för att trigga lazy load
-                for _ in range(10):
+                for _ in range(8):
                     await frame.evaluate("window.scrollBy(0, window.innerHeight)")
                     await asyncio.sleep(0.4)
 
@@ -215,6 +213,10 @@ async def capture_network(ar_input, run_dir):
                 print("⚠️ Frame ej läsbar (cross-origin):", frame.url, e)
 
         print("✅ TOTALT hittade annonskort:", len(all_ads))
+
+        # klipp ner listan redan här till MAX_ADS * 2 (lite buffert)
+        if len(all_ads) > MAX_ADS * 2:
+            all_ads = all_ads[: MAX_ADS * 2]
 
         OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
         CANDIDATES_PATH.write_text(
@@ -230,7 +232,7 @@ async def capture_network(ar_input, run_dir):
 
 
 # ============================================================
-# EXCEL + bildnedladdning + OCR
+# EXCEL + bildnedladdning + begränsad OCR/embedding
 # ============================================================
 
 def process_candidates_and_save(run_dir):
@@ -246,7 +248,7 @@ def process_candidates_and_save(run_dir):
         return False
 
     ads = data[0].get("parsed") or []
-    print("⏳ Bearbetar annonser:", len(ads))
+    print("⏳ Bearbetar annonser (totalt):", len(ads))
 
     rows = []
     session = requests.Session()
@@ -282,7 +284,10 @@ def process_candidates_and_save(run_dir):
         img_url = best["src"] if best and best.get("src") else ""
         img_file = ""
 
-        if img_url and DOWNLOAD_IMAGES:
+        # Bara de första MAX_RICH_ADS annonserna får bildnedladdning
+        do_rich = (idx <= MAX_RICH_ADS)
+
+        if do_rich and img_url and DOWNLOAD_IMAGES:
             try:
                 url = img_url
                 if url.startswith("//"):
@@ -314,10 +319,9 @@ def process_candidates_and_save(run_dir):
             description = " ".join(lines[2:])
         elif len(lines) == 2:
             description = lines[1]
-   # kör bara OCR för de första MAX_OCR_ADS annonserna
-        do_ocr = (idx <= MAX_OCR_ADS)
 
-        # OCR-fallback om vi saknar rubrik + beskrivning men har bild
+        # OCR-fallback för ett begränsat antal (MAX_OCR_ADS, och bara om vi laddat ner bilden)
+        do_ocr = do_rich and (idx <= MAX_OCR_ADS)
         if do_ocr and not headline.strip() and not description.strip() and img_file:
             ocr_txt = ocr_image(img_file)
             ocr_lines = [l.strip() for l in ocr_txt.splitlines() if l.strip()]
@@ -326,7 +330,6 @@ def process_candidates_and_save(run_dir):
                     headline = ocr_lines[0][:120]
                 if len(ocr_lines) > 1 and not description.strip():
                     description = " ".join(ocr_lines[1:])[:500]
-
 
         rows.append({
             "Index": idx,
@@ -350,14 +353,14 @@ def process_candidates_and_save(run_dir):
     df.to_excel(excel, index=False)
     print("📊 Grund-Excel sparad:", excel)
 
-    # Bädda in bilder
+    # Bädda in bilder – bara för rader som faktiskt har Bildfil (dvs första MAX_RICH_ADS)
     wb = load_workbook(excel)
     ws = wb.active
 
     for r, row in enumerate(rows, start=2):
         f = row["Bildfil"]
         if not f or not Path(f).exists():
-            continue
+            continue  # denna rad får bara URL, ingen inbäddad bild
 
         try:
             img = Image.open(f)
@@ -387,8 +390,3 @@ def process_candidates_and_save(run_dir):
     wb.save(excel)
     print("✅ Excel med inbäddade bilder:", excel)
     return True
-
-
-
-
-
