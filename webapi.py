@@ -1,11 +1,20 @@
 # webapi.py
+from fastapi import FastAPI, Form, Request, HTTPException, UploadFile, File
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 from pathlib import Path
 import os, json, uuid, asyncio, traceback, time
-
 from ads_capture_and_extract import capture_network, process_candidates_and_save
+from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
+from pathlib import Path
+import os, json, uuid, asyncio, traceback, time
+import tempfile
+from io import BytesIO
+from openpyxl import load_workbook
+from openpyxl.utils.cell import coordinate_to_tuple
+from PIL import Image
+import pytesseract
 
 app = FastAPI()
 
@@ -191,6 +200,97 @@ def get_logs(job_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="unknown_job_id")
     return PlainTextResponse(p.read_text(encoding="utf-8"))
+
+def add_ocr_to_excel(input_path: Path, output_path: Path):
+    """
+    Läser en Excel med annonser + inbäddade bilder i första bladet.
+    För rader där Rubrik/Beskrivning är tomma och det finns bild,
+    körs OCR och dessa fält fylls i.
+    """
+    MAX_OCR_ROWS = int(os.getenv("MAX_OCR_FROM_EXCEL", "80"))
+
+    wb = load_workbook(input_path)
+    ws = wb.active
+
+    # Hitta kolumnerna Rubrik / Beskrivning (skapa om de inte finns)
+    header_row = 1
+    header_map = {}
+    for col in range(1, ws.max_column + 1):
+        val = ws.cell(row=header_row, column=col).value
+        if isinstance(val, str):
+            header_map[val.strip()] = col
+
+    rubrik_col = header_map.get("Rubrik")
+    if rubrik_col is None:
+        rubrik_col = ws.max_column + 1
+        ws.cell(row=header_row, column=rubrik_col, value="Rubrik")
+
+    beskriv_col = header_map.get("Beskrivning")
+    if beskriv_col is None:
+        beskriv_col = ws.max_column + 1
+        ws.cell(row=header_row, column=beskriv_col, value="Beskrivning")
+
+    # Mappa radnummer -> inbäddad bild (första bilden per rad)
+    row_to_image = {}
+
+    for img in getattr(ws, "_images", []):
+        row = None
+        anchor = img.anchor
+        try:
+            # vanligast i openpyxl
+            row = anchor._from.row + 1
+        except Exception:
+            try:
+                row = anchor.from_.row + 1
+            except Exception:
+                if isinstance(getattr(anchor, "anchor", None), str):
+                    r, _ = coordinate_to_tuple(anchor.anchor)
+                    row = r
+        if row is None:
+            continue
+
+        try:
+            data = img._data()
+            pil = Image.open(BytesIO(data))
+            row_to_image.setdefault(row, []).append(pil)
+        except Exception as e:
+            print("OCR: kunde inte läsa bild för rad", row, e)
+
+    # Kör OCR på de första MAX_OCR_ROWS raderna där det saknas text
+    ocr_done = 0
+    for row in range(2, ws.max_row + 1):
+        if ocr_done >= MAX_OCR_ROWS:
+            break
+        if row not in row_to_image:
+            continue
+
+        rubrik_cell = ws.cell(row=row, column=rubrik_col)
+        beskriv_cell = ws.cell(row=row, column=beskriv_col)
+
+        # hoppa rader som redan har text
+        if (rubrik_cell.value and str(rubrik_cell.value).strip()) or (
+            beskriv_cell.value and str(beskriv_cell.value).strip()
+        ):
+            continue
+
+        img_pil = row_to_image[row][0]
+        try:
+            text = pytesseract.image_to_string(img_pil, lang="swe+eng")
+        except Exception as e:
+            print("OCR-fel på rad", row, e)
+            continue
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            continue
+
+        rubrik_cell.value = lines[0][:120]
+        if len(lines) > 1:
+            beskriv_cell.value = " ".join(lines[1:])[:500]
+
+        ocr_done += 1
+
+    wb.save(output_path)
 
 @app.post("/ocr_ads")
 async def ocr_ads(file: UploadFile = File(...)):
