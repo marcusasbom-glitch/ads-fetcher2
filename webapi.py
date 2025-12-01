@@ -191,3 +191,29 @@ def get_logs(job_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="unknown_job_id")
     return PlainTextResponse(p.read_text(encoding="utf-8"))
+
+@app.post("/ocr_ads")
+async def ocr_ads(file: UploadFile = File(...)):
+    """
+    Tar emot en Excel-fil med annonser (från din scraper),
+    lägger till rubriker/beskrivningar via OCR på inbäddade bilder
+    och returnerar en ny Excel.
+    """
+    suffix = Path(file.filename).suffix or ".xlsx"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        input_path = tmpdir / f"input{suffix}"
+        input_path.write_bytes(await file.read())
+
+        output_path = tmpdir / "ads_with_ocr.xlsx"
+        add_ocr_to_excel(input_path, output_path)
+
+        return FileResponse(
+            str(output_path),
+            filename="ads_with_ocr.xlsx",
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+        )
+
