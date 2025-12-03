@@ -210,6 +210,34 @@ def get_logs(job_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="unknown_job_id")
     return PlainTextResponse(p.read_text(encoding="utf-8"))
+    @app.get("/ocr_job/{job_id}")
+def ocr_job(job_id: str):
+    """
+    Kör OCR på alla bilder i job_dir/images för ett befintligt jobb
+    och returnerar ett Excel med resultatet.
+    """
+    job_dir = RUNS_DIR / job_id
+    images_dir = job_dir / "images"
+
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+
+    if not images_dir.exists() or not any(images_dir.iterdir()):
+        raise HTTPException(status_code=404, detail="no_images_for_job")
+
+    try:
+        excel_bytes = ocr_images_in_dir(images_dir)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
+
+    filename = f"ads_ocr_{job_id}.xlsx"
+
+    return Response(
+        content=excel_bytes.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
 
 def add_ocr_to_excel(input_path: Path, output_path: Path):
     """
@@ -301,6 +329,45 @@ def add_ocr_to_excel(input_path: Path, output_path: Path):
         ocr_done += 1
 
     wb.save(output_path)
+def ocr_images_in_dir(images_dir: Path) -> BytesIO:
+    """
+    Kör OCR på alla bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
+    Kolumner:
+      Bildfil, Rubrik, Beskrivning, Rå_OCR_text
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "OCR_Ads"
+    ws.append(["Bildfil", "Rubrik", "Beskrivning", "Rå_OCR_text"])
+
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+
+    for img_path in sorted(images_dir.iterdir()):
+        if img_path.suffix.lower() not in exts:
+            continue
+
+        try:
+            img = Image.open(img_path)
+            # svenska + engelska
+            text = pytesseract.image_to_string(img, lang="swe+eng")
+        except Exception as e:
+            ws.append([img_path.name, f"OCR-fel: {e}", "", ""])
+            continue
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+        if lines:
+            title = lines[0][:200]
+            desc = " ".join(lines[1:])[:800] if len(lines) > 1 else ""
+        else:
+            title, desc = "", ""
+
+        ws.append([img_path.name, title, desc, text])
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
 
 @app.post("/ocr_ads")
 async def ocr_ads(file: UploadFile = File(...)):
