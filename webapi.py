@@ -1,6 +1,16 @@
 # webapi.py
 from fastapi import FastAPI, Form, Request, HTTPException, UploadFile, File
-from fastapi import FastAPI, Form, Request, HTTPException
+from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
+
+from pathlib import Path
+import os, json, uuid, asyncio, traceback, time
+import tempfile
+from io import BytesIO
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils.cell import coordinate_to_tuple
+from PIL import Image
+import pytesseract
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 from pathlib import Path
