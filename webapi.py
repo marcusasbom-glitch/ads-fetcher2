@@ -1,30 +1,18 @@
 # webapi.py
-from fastapi import FastAPI, Form, Request, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 
-from pathlib import Path
-import os, json, uuid, asyncio, traceback, time
-import tempfile
-from io import BytesIO
-
-from openpyxl import load_workbook, Workbook
-from openpyxl.utils.cell import coordinate_to_tuple
-from PIL import Image
-import pytesseract
+from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
 from pathlib import Path
 import os, json, uuid, asyncio, traceback, time
-from ads_capture_and_extract import capture_network, process_candidates_and_save
-from fastapi.responses import FileResponse, Response, JSONResponse, PlainTextResponse
-from pathlib import Path
-import os, json, uuid, asyncio, traceback, time
-import tempfile
+
 from io import BytesIO
-from openpyxl import load_workbook
-from openpyxl.utils.cell import coordinate_to_tuple
+
+from openpyxl import Workbook
 from PIL import Image
 import pytesseract
+
+from ads_capture_and_extract import capture_network, process_candidates_and_save
 
 app = FastAPI()
 
@@ -54,33 +42,52 @@ def preflight_catchall(rest_of_path: str, request: Request):
 # ----- Root/health -----
 @app.get("/")
 def root():
-    return JSONResponse({"ok": True, "service": "ads-fetcher",
-                         "endpoints": ["/ping", "/run", "/status/{job_id}", "/download/{job_id}", "/logs/{job_id}"]})
+    return JSONResponse(
+        {
+            "ok": True,
+            "service": "ads-fetcher",
+            "endpoints": [
+                "/ping",
+                "/run",
+                "/status/{job_id}",
+                "/download/{job_id}",
+                "/logs/{job_id}",
+                "/ocr_job/{job_id}",
+            ],
+        }
+    )
+
 
 @app.head("/")
 def root_head():
     return Response(status_code=200)
 
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status_code=204)
+
 
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
+
 # ----- Lagring -----
 RUNS_DIR = Path(os.getenv("RUNS_DIR", "/tmp/runs"))
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def write_json(p: Path, obj: dict):
     p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+
 
 def append_log(job_dir: Path, line: str):
     lp = job_dir / "log.txt"
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with lp.open("a", encoding="utf-8") as f:
         f.write(f"[{ts}] {line}\n")
+
 
 def write_status(job_dir: Path, **fields):
     sp = job_dir / "status.json"
@@ -93,6 +100,7 @@ def write_status(job_dir: Path, **fields):
     data.update(fields)
     write_json(sp, data)
 
+
 def read_status(job_dir: Path):
     sp = job_dir / "status.json"
     if not sp.exists():
@@ -102,8 +110,10 @@ def read_status(job_dir: Path):
     except Exception:
         return None
 
+
 # ----- Jobb -----
 OVERALL_DEADLINE_SEC = int(os.getenv("OVERALL_DEADLINE_SEC", "1200"))  # 20 min hårdgräns
+
 
 async def run_with_timeout(coro, timeout_sec: int, step_name: str, job_dir: Path):
     try:
@@ -115,6 +125,7 @@ async def run_with_timeout(coro, timeout_sec: int, step_name: str, job_dir: Path
         append_log(job_dir, f"FEL i steg: {step_name}: {e}")
         raise
 
+
 async def do_job(job_id: str, ar_input: str):
     job_dir = RUNS_DIR / job_id
     append_log(job_dir, f"JOB START ar_input='{ar_input}'")
@@ -124,7 +135,7 @@ async def do_job(job_id: str, ar_input: str):
         # WATCHDOG för hela jobbet
         async def whole():
             write_status(job_dir, progress=5, message="Fångar nätverk…")
-            # Capture (lägg gärna egen timeout här – t.ex. 12 min)
+            # Capture (egen timeout – t.ex. 12 min)
             await run_with_timeout(
                 capture_network(ar_input, run_dir=job_dir),
                 timeout_sec=12 * 60,
@@ -146,11 +157,11 @@ async def do_job(job_id: str, ar_input: str):
                 append_log(job_dir, f"DEBUG JSON error: {e}")
 
             write_status(job_dir, progress=70, message="Bearbetar och bygger Excel…")
-            # Kör synk del i thread och sätt timeout (t.ex. 6 min)
+            # Kör synk del i thread och sätt timeout (t.ex. 6–15 min)
             loop = asyncio.get_running_loop()
             await asyncio.wait_for(
                 loop.run_in_executor(None, process_candidates_and_save, job_dir),
-                timeout=15 * 60
+                timeout=15 * 60,
             )
 
         await asyncio.wait_for(whole(), timeout=OVERALL_DEADLINE_SEC)
@@ -167,6 +178,7 @@ async def do_job(job_id: str, ar_input: str):
         write_status(job_dir, status="error", message=str(e))
         append_log(job_dir, f"JOB ERROR: {e}\n{tb}")
 
+
 @app.post("/run")
 async def run(ar_input: str = Form(...)):
     job_id = uuid.uuid4().hex[:12]
@@ -177,6 +189,7 @@ async def run(ar_input: str = Form(...)):
 
     asyncio.create_task(do_job(job_id, ar_input.strip()))
     return {"job_id": job_id, "status": "queued"}
+
 
 @app.get("/status/{job_id}")
 def status(job_id: str, request: Request):
@@ -191,6 +204,7 @@ def status(job_id: str, request: Request):
     )
     return data
 
+
 @app.get("/download/{job_id}", name="download")
 def download(job_id: str):
     job_dir = RUNS_DIR / job_id
@@ -203,6 +217,7 @@ def download(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+
 @app.get("/logs/{job_id}")
 def get_logs(job_id: str):
     job_dir = RUNS_DIR / job_id
@@ -210,140 +225,25 @@ def get_logs(job_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="unknown_job_id")
     return PlainTextResponse(p.read_text(encoding="utf-8"))
-    @app.get("/ocr_job/{job_id}")
-def ocr_job(job_id: str):
-    """
-    Kör OCR på alla bilder i job_dir/images för ett befintligt jobb
-    och returnerar ett Excel med resultatet.
-    """
-    job_dir = RUNS_DIR / job_id
-    images_dir = job_dir / "images"
-
-    if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="unknown_job_id")
-
-    if not images_dir.exists() or not any(images_dir.iterdir()):
-        raise HTTPException(status_code=404, detail="no_images_for_job")
-
-    try:
-        excel_bytes = ocr_images_in_dir(images_dir)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
-
-    filename = f"ads_ocr_{job_id}.xlsx"
-
-    return Response(
-        content=excel_bytes.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
 
 
-def add_ocr_to_excel(input_path: Path, output_path: Path):
-    """
-    Läser en Excel med annonser + inbäddade bilder i första bladet.
-    För rader där Rubrik/Beskrivning är tomma och det finns bild,
-    körs OCR och dessa fält fylls i.
-    """
-    MAX_OCR_ROWS = int(os.getenv("MAX_OCR_FROM_EXCEL", "80"))
+# ----- OCR på bildfiler i job_dir/images -----
 
-    wb = load_workbook(input_path)
-    ws = wb.active
 
-    # Hitta kolumnerna Rubrik / Beskrivning (skapa om de inte finns)
-    header_row = 1
-    header_map = {}
-    for col in range(1, ws.max_column + 1):
-        val = ws.cell(row=header_row, column=col).value
-        if isinstance(val, str):
-            header_map[val.strip()] = col
-
-    rubrik_col = header_map.get("Rubrik")
-    if rubrik_col is None:
-        rubrik_col = ws.max_column + 1
-        ws.cell(row=header_row, column=rubrik_col, value="Rubrik")
-
-    beskriv_col = header_map.get("Beskrivning")
-    if beskriv_col is None:
-        beskriv_col = ws.max_column + 1
-        ws.cell(row=header_row, column=beskriv_col, value="Beskrivning")
-
-    # Mappa radnummer -> inbäddad bild (första bilden per rad)
-    row_to_image = {}
-
-    for img in getattr(ws, "_images", []):
-        row = None
-        anchor = img.anchor
-        try:
-            # vanligast i openpyxl
-            row = anchor._from.row + 1
-        except Exception:
-            try:
-                row = anchor.from_.row + 1
-            except Exception:
-                if isinstance(getattr(anchor, "anchor", None), str):
-                    r, _ = coordinate_to_tuple(anchor.anchor)
-                    row = r
-        if row is None:
-            continue
-
-        try:
-            data = img._data()
-            pil = Image.open(BytesIO(data))
-            row_to_image.setdefault(row, []).append(pil)
-        except Exception as e:
-            print("OCR: kunde inte läsa bild för rad", row, e)
-
-    # Kör OCR på de första MAX_OCR_ROWS raderna där det saknas text
-    ocr_done = 0
-    for row in range(2, ws.max_row + 1):
-        if ocr_done >= MAX_OCR_ROWS:
-            break
-        if row not in row_to_image:
-            continue
-
-        rubrik_cell = ws.cell(row=row, column=rubrik_col)
-        beskriv_cell = ws.cell(row=row, column=beskriv_col)
-
-        # hoppa rader som redan har text
-        if (rubrik_cell.value and str(rubrik_cell.value).strip()) or (
-            beskriv_cell.value and str(beskriv_cell.value).strip()
-        ):
-            continue
-
-        img_pil = row_to_image[row][0]
-        try:
-            text = pytesseract.image_to_string(img_pil, lang="swe+eng")
-        except Exception as e:
-            print("OCR-fel på rad", row, e)
-            continue
-
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if not lines:
-            continue
-
-        rubrik_cell.value = lines[0][:120]
-        if len(lines) > 1:
-            beskriv_cell.value = " ".join(lines[1:])[:500]
-
-        ocr_done += 1
-
-    wb.save(output_path)
 def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     """
     Kör OCR på alla bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
-    Kolumner:
-      Bildfil, Rubrik, Beskrivning, Rå_OCR_text
+    Kolumner: Bildfil, Rubrik, Beskrivning, Rå_OCR_text
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "OCR_Ads"
     ws.append(["Bildfil", "Rubrik", "Beskrivning", "Rå_OCR_text"])
 
-    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    valid_exts = {".png", ".jpg", ".jpeg", ".webp"}
 
     for img_path in sorted(images_dir.iterdir()):
-        if img_path.suffix.lower() not in exts:
+        if img_path.suffix.lower() not in valid_exts:
             continue
 
         try:
@@ -369,33 +269,30 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     out.seek(0)
     return out
 
-@app.post("/ocr_ads")
-async def ocr_ads(file: UploadFile = File(...)):
+
+@app.get("/ocr_job/{job_id}")
+def ocr_job(job_id: str):
     """
-    Tar emot en Excel-fil med annonser, kör OCR på inbäddade annonsbilder,
-    lägger till textkolumner och returnerar en ny Excel-fil.
+    Kör OCR på alla bilder för ett befintligt jobb (job_dir/images)
+    och returnerar en ny Excel-fil med OCR-resultat.
     """
-    # Tillfällig arbetsmapp
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    job_dir = RUNS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="unknown_job_id")
 
-        # Spara uppladdad fil
-        in_path = tmp / file.filename
-        in_path.write_bytes(await file.read())
+    images_dir = job_dir / "images"
+    if not images_dir.exists() or not any(images_dir.iterdir()):
+        raise HTTPException(status_code=404, detail="no_images_for_job")
 
-        out_path = tmp / "ads_with_ocr.xlsx"
+    try:
+        excel_bytes = ocr_images_in_dir(images_dir)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
 
-        # Kör OCR-bearbetning
-        try:
-            add_ocr_to_excel(in_path, out_path)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
+    filename = f"ads_ocr_{job_id}.xlsx"
 
-        # Returnera filen
-        return FileResponse(
-            str(out_path),
-            filename="ads_with_ocr.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-
+    return Response(
+        content=excel_bytes.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+    )
