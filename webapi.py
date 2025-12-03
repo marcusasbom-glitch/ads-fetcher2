@@ -268,6 +268,10 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     wb.save(out)
     out.seek(0)
     return out
+@app.get("/widget", response_class=HTMLResponse)
+def widget():
+    return HTMLResponse(WIDGET_HTML)
+
 
 WIDGET_HTML = """<!DOCTYPE html>
 <html lang="sv">
