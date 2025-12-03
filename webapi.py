@@ -295,25 +295,30 @@ def add_ocr_to_excel(input_path: Path, output_path: Path):
 @app.post("/ocr_ads")
 async def ocr_ads(file: UploadFile = File(...)):
     """
-    Tar emot en Excel-fil med annonser (från din scraper),
-    lägger till rubriker/beskrivningar via OCR på inbäddade bilder
-    och returnerar en ny Excel.
+    Tar emot en Excel-fil med annonser, kör OCR på inbäddade annonsbilder,
+    lägger till textkolumner och returnerar en ny Excel-fil.
     """
-    suffix = Path(file.filename).suffix or ".xlsx"
-
+    # Tillfällig arbetsmapp
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / f"input{suffix}"
-        input_path.write_bytes(await file.read())
+        tmp = Path(tmpdir)
 
-        output_path = tmpdir / "ads_with_ocr.xlsx"
-        add_ocr_to_excel(input_path, output_path)
+        # Spara uppladdad fil
+        in_path = tmp / file.filename
+        in_path.write_bytes(await file.read())
 
+        out_path = tmp / "ads_with_ocr.xlsx"
+
+        # Kör OCR-bearbetning
+        try:
+            add_ocr_to_excel(in_path, out_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
+
+        # Returnera filen
         return FileResponse(
-            str(output_path),
+            str(out_path),
             filename="ads_with_ocr.xlsx",
-            media_type=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
 
