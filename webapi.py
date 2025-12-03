@@ -269,6 +269,336 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     out.seek(0)
     return out
 
+WIDGET_HTML = """<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <title>Annons-scraper</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:#f7f7f7;
+      margin:0;
+      padding:16px;
+    }
+    #ads-scraper-widget {
+      border:1px solid #ddd;
+      border-radius:8px;
+      max-width:650px;
+      margin:0 auto;
+      padding:16px;
+      background:#fff;
+    }
+    .label { display:block; margin-bottom:4px; font-weight:600; }
+    input[type=text] { width:100%; padding:6px; margin-bottom:8px; }
+    button { padding:6px 12px; cursor:pointer; }
+    #debugLog {
+      margin-top:16px;
+      background:#000;
+      color:#0f0;
+      font-family:monospace;
+      font-size:11px;
+      padding:6px;
+      height:140px;
+      overflow:auto;
+      white-space:pre-wrap;
+    }
+    .progress-bar-bg {
+      background:#eee;
+      border-radius:4px;
+      overflow:hidden;
+      height:14px;
+      max-width:320px;
+      margin-bottom:8px;
+    }
+    .progress-bar-fill {
+      width:0%;
+      height:100%;
+      background:#4caf50;
+      transition:width 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div id="ads-scraper-widget">
+    <h3>Annonsinsamling från Google Ads Transparency Center</h3>
+
+    <p>Steg 1: Ange AR-ID eller full URL till annonsörssidan.</p>
+
+    <label for="arInput" class="label">AR-ID eller URL</label>
+    <input id="arInput" type="text" placeholder="t.ex. AR01255062578594316289" />
+
+    <button id="startBtn" type="button">Starta scraping</button>
+    <span id="startStatus" style="font-size:0.9rem;"></span>
+
+    <hr style="margin:16px 0;" />
+
+    <div id="jobInfo" style="display:none;">
+      <h4>Jobbstatus</h4>
+
+      <p style="margin:4px 0;">
+        <strong>Status:</strong>
+        <span id="jobStatusText">–</span>
+      </p>
+
+      <p style="margin:4px 0;">
+        <strong>Meddelande:</strong>
+        <span id="jobMessage">–</span>
+      </p>
+
+      <p style="margin:4px 0 8px 0;">
+        <strong>Progress:</strong>
+        <span id="jobProgress">–</span>
+      </p>
+
+      <div class="progress-bar-bg">
+        <div id="jobProgressBar" class="progress-bar-fill"></div>
+      </div>
+
+      <p id="downloadWrapper" style="display:none;margin:4px 0;">
+        <strong>Excel:</strong>
+        <a id="downloadLink" href="#" target="_blank">Ladda ner annonsfil</a>
+      </p>
+
+      <p id="logsWrapper" style="display:none;margin:4px 0;">
+        <strong>Loggar:</strong>
+        <a id="logsLink" href="#" target="_blank">Visa logg</a>
+      </p>
+
+      <hr style="margin:16px 0;" />
+
+      <h4>Steg 2 (valfritt): OCR på annonsbilder</h4>
+      <p style="margin-top:0;">
+        När scraping är klar kan du köra OCR på alla annonsbilder för att läsa ut rubriker
+        och beskrivningar direkt från bilderna.
+      </p>
+
+      <button id="ocrImagesBtn" type="button" disabled style="margin-right:8px;">
+        Kör OCR på annonsbilderna
+      </button>
+      <span id="ocrImagesStatus" style="font-size:0.9rem;"></span>
+    </div>
+
+    <div id="debugLog"></div>
+  </div>
+
+  <script>
+  (function() {
+    const API_BASE = window.location.origin; // samma domän som backend
+
+    const arInput       = document.getElementById("arInput");
+    const startBtn      = document.getElementById("startBtn");
+    const startStatus   = document.getElementById("startStatus");
+
+    const jobInfo       = document.getElementById("jobInfo");
+    const jobStatusText = document.getElementById("jobStatusText");
+    const jobMessage    = document.getElementById("jobMessage");
+    const jobProgress   = document.getElementById("jobProgress");
+    const jobProgressBar= document.getElementById("jobProgressBar");
+
+    const downloadWrapper = document.getElementById("downloadWrapper");
+    const downloadLink    = document.getElementById("downloadLink");
+    const logsWrapper     = document.getElementById("logsWrapper");
+    const logsLink        = document.getElementById("logsLink");
+
+    const ocrBtn          = document.getElementById("ocrImagesBtn");
+    const ocrStatus       = document.getElementById("ocrImagesStatus");
+
+    const debugLog        = document.getElementById("debugLog");
+
+    let currentJobId = null;
+    let pollTimer    = null;
+
+    function log(msg) {
+      const ts = new Date().toISOString().slice(11,19);
+      debugLog.textContent += "[" + ts + "] " + msg + "\\n";
+      debugLog.scrollTop = debugLog.scrollHeight;
+    }
+
+    function resetUI() {
+      jobInfo.style.display      = "none";
+      jobStatusText.textContent  = "–";
+      jobMessage.textContent     = "–";
+      jobProgress.textContent    = "–";
+      jobProgressBar.style.width = "0%";
+      downloadWrapper.style.display = "none";
+      logsWrapper.style.display     = "none";
+      ocrBtn.disabled           = true;
+      ocrStatus.textContent     = "";
+    }
+
+    async function startJob() {
+      const val = (arInput.value || "").trim();
+      if (!val) {
+        startStatus.textContent = "Fyll i AR-ID eller URL först.";
+        return;
+      }
+
+      resetUI();
+      startStatus.textContent = "Startar jobb...";
+      startBtn.disabled = true;
+      log("Startar scraping för: " + val);
+
+      try {
+        const fd = new FormData();
+        fd.append("ar_input", val);
+
+        const resp = await fetch(API_BASE + "/run", {
+          method: "POST",
+          body: fd
+        });
+
+        if (!resp.ok) {
+          const t = await resp.text();
+          startStatus.textContent = "Fel vid start: " + t;
+          log("Fel vid /run: " + resp.status + " " + t);
+          startBtn.disabled = false;
+          return;
+        }
+
+        const data = await resp.json();
+        currentJobId = data.job_id;
+        log("Jobb skapat, id=" + currentJobId);
+
+        startStatus.textContent = "Jobb skapat (ID: " + currentJobId + "). Hämtar status...";
+        jobInfo.style.display = "block";
+
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(function() { pollStatus(currentJobId); }, 3000);
+        pollStatus(currentJobId);
+      } catch (err) {
+        console.error(err);
+        log("Tekniskt fel vid startJob: " + err);
+        startStatus.textContent = "Tekniskt fel: " + err;
+        startBtn.disabled = false;
+      }
+    }
+
+    async function pollStatus(jobId) {
+      try {
+        const url = API_BASE + "/status/" + encodeURIComponent(jobId);
+        log("Pollar status: " + url);
+
+        const resp = await fetch(url, { method: "GET" });
+
+        if (!resp.ok) {
+          const t = await resp.text();
+          jobStatusText.textContent = "Fel (" + resp.status + ")";
+          jobMessage.textContent    = t;
+          jobProgress.textContent   = "–";
+          jobProgressBar.style.width = "0%";
+          log("Fel vid /status: " + resp.status + " " + t);
+          clearInterval(pollTimer);
+          pollTimer = null;
+          startBtn.disabled = false;
+          return;
+        }
+
+        const data = await resp.json();
+
+        jobStatusText.textContent = data.status || "-";
+        jobMessage.textContent    = data.message || "";
+        if (data.progress != null) {
+          jobProgress.textContent = data.progress + "%";
+          jobProgressBar.style.width =
+            Math.min(100, Math.max(0, Number(data.progress))) + "%";
+        } else {
+          jobProgress.textContent = "–";
+          jobProgressBar.style.width = "0%";
+        }
+
+        if (data.result_url) {
+          downloadWrapper.style.display = "block";
+          downloadLink.href = data.result_url;
+        }
+
+        logsWrapper.style.display = "block";
+        logsLink.href = API_BASE + "/logs/" + encodeURIComponent(jobId);
+
+        if (data.status === "done") {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          startBtn.disabled = false;
+          startStatus.textContent = "Jobb klart.";
+          log("Jobb klart.");
+          ocrBtn.disabled = false;
+          ocrStatus.textContent = "Scraping klar – du kan nu köra OCR på annonsbilderna.";
+        } else if (data.status === "error") {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          startBtn.disabled = false;
+          startStatus.textContent = "Jobbet misslyckades.";
+          log("Jobbet markerat som error.");
+        } else {
+          startStatus.textContent = "Jobb pågår (" + (data.status || "okänt") + ")...";
+        }
+
+      } catch (err) {
+        console.error(err);
+        jobMessage.textContent = "Tekniskt fel vid polling: " + err;
+        log("Tekniskt fel vid polling: " + err);
+        startBtn.disabled = false;
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      }
+    }
+
+    async function runOCR() {
+      if (!currentJobId) {
+        ocrStatus.textContent = "Inget aktivt jobb-ID. Kör scraping först.";
+        return;
+      }
+
+      ocrBtn.disabled = true;
+      ocrStatus.textContent = "Kör OCR på annonsbilderna...";
+      log("Startar OCR för jobb " + currentJobId);
+
+      try {
+        const url = API_BASE + "/ocr_job/" + encodeURIComponent(currentJobId);
+        const resp = await fetch(url, { method: "GET" });
+
+        if (!resp.ok) {
+          const txt = await resp.text();
+          ocrStatus.textContent = "Fel vid OCR: " + txt;
+          log("Fel vid /ocr_job: " + resp.status + " " + txt);
+          ocrBtn.disabled = false;
+          return;
+        }
+
+        const blob = await resp.blob();
+        const dlUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = dlUrl;
+        a.download = "ads_ocr_" + currentJobId + ".xlsx";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(dlUrl);
+
+        ocrStatus.textContent = "OCR klar – fil nedladdad.";
+        log("OCR-fil nedladdad.");
+      } catch (err) {
+        console.error(err);
+        ocrStatus.textContent = "Tekniskt fel vid OCR: " + err;
+        log("Tekniskt fel vid OCR: " + err);
+      } finally {
+        ocrBtn.disabled = false;
+      }
+    }
+
+    startBtn.addEventListener("click", startJob);
+    ocrBtn.addEventListener("click", runOCR);
+
+    log("Widget laddad. API_BASE=" + API_BASE);
+  })();
+  </script>
+</body>
+</html>
+"""
+
 
 @app.get("/ocr_job/{job_id}")
 def ocr_job(job_id: str):
