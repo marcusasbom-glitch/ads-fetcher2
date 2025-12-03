@@ -14,11 +14,17 @@ RUN apt-get update && \
     apt-get install -y tesseract-ocr tesseract-ocr-swe && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && \
+    apt-get install -y tesseract-ocr tesseract-ocr-swe && \
+    rm -rf /var/lib/apt/lists/*
+
+
 
 # Exponera port som Render förser via $PORT
 EXPOSE 8000
 
 # Starta FastAPI
 CMD ["sh", "-c", "uvicorn webapi:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
 
 
