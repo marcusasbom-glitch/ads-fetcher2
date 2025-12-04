@@ -13,15 +13,28 @@ from fastapi.responses import (
 from pathlib import Path
 import os, json, uuid, asyncio, traceback, time
 from io import BytesIO
+import re  # <--- NYTT
 
 from openpyxl import Workbook
-from openpyxl.utils.cell import ILLEGAL_CHARACTERS_RE  # <-- NY IMPORT
 from PIL import Image
 import pytesseract
 
 from ads_capture_and_extract import capture_network, process_candidates_and_save
 
 app = FastAPI()
+
+# ---------------------------------------------------
+# Hjälpfunktion: rensa bort ogiltiga Excel-tecken
+# (alla kontrolltecken \x00–\x1F utom \t,\n,\r)
+# ---------------------------------------------------
+_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+
+def clean_excel_text(value) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return _ILLEGAL_RE.sub("", value)
 
 # ---------------------------------------------------
 # CORS
@@ -249,28 +262,27 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
 
         try:
             img = Image.open(img_path)
-            text = pytesseract.image_to_string(img, lang="swe+eng")
+            raw_text = pytesseract.image_to_string(img, lang="swe+eng")
         except Exception as e:
-            # skriv felmeddelandet, men rensa bort förbjudna tecken
-            safe_err = ILLEGAL_CHARACTERS_RE.sub("", str(e))
-            ws.append([img_path.name, "OCR-fel", "", safe_err])
+            safe_err = clean_excel_text(e)
+            ws.append([clean_excel_text(img_path.name), "OCR-fel", "", safe_err])
             continue
 
-        # Rensa bort otillåtna Excel-tecken från OCR-texten
-        text = ILLEGAL_CHARACTERS_RE.sub("", text)
+        text = clean_excel_text(raw_text)
 
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if lines:
-            title = lines[0][:200]
-            desc = " ".join(lines[1:])[:800] if len(lines) > 1 else ""
+            title = clean_excel_text(lines[0][:200])
+            desc  = clean_excel_text(" ".join(lines[1:])[:800]) if len(lines) > 1 else ""
         else:
             title, desc = "", ""
 
-        # Rensa även rubrik och beskrivning
-        title = ILLEGAL_CHARACTERS_RE.sub("", title)
-        desc  = ILLEGAL_CHARACTERS_RE.sub("", desc)
-
-        ws.append([img_path.name, title, desc, text])
+        ws.append([
+            clean_excel_text(img_path.name),
+            title,
+            desc,
+            text,
+        ])
 
     out = BytesIO()
     wb.save(out)
