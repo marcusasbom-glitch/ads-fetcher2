@@ -434,7 +434,8 @@ WIDGET_HTML = """<!DOCTYPE html>
 
   <script>
   (function() {
-    const API_BASE = window.location.origin;
+    const API_BASE = "https://ads-fetcher.onrender.com";
+// byt ut mot exakt din Render-URL om den skiljer sig
 
     const arInput       = document.getElementById("arInput");
     const startBtn      = document.getElementById("startBtn");
