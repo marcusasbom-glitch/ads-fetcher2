@@ -15,6 +15,7 @@ import os, json, uuid, asyncio, traceback, time
 from io import BytesIO
 
 from openpyxl import Workbook
+from openpyxl.utils.cell import ILLEGAL_CHARACTERS_RE  # <-- NY IMPORT
 from PIL import Image
 import pytesseract
 
@@ -250,8 +251,13 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
             img = Image.open(img_path)
             text = pytesseract.image_to_string(img, lang="swe+eng")
         except Exception as e:
-            ws.append([img_path.name, f"OCR-fel: {e}", "", ""])
+            # skriv felmeddelandet, men rensa bort förbjudna tecken
+            safe_err = ILLEGAL_CHARACTERS_RE.sub("", str(e))
+            ws.append([img_path.name, "OCR-fel", "", safe_err])
             continue
+
+        # Rensa bort otillåtna Excel-tecken från OCR-texten
+        text = ILLEGAL_CHARACTERS_RE.sub("", text)
 
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if lines:
@@ -259,6 +265,10 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
             desc = " ".join(lines[1:])[:800] if len(lines) > 1 else ""
         else:
             title, desc = "", ""
+
+        # Rensa även rubrik och beskrivning
+        title = ILLEGAL_CHARACTERS_RE.sub("", title)
+        desc  = ILLEGAL_CHARACTERS_RE.sub("", desc)
 
         ws.append([img_path.name, title, desc, text])
 
