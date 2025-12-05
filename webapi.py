@@ -246,9 +246,20 @@ def get_logs(job_id: str):
 # ---------------------------------------------------
 def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     """
-    Kör OCR på alla bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
+    Kör OCR på ett begränsat antal bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
     Kolumner: Bildfil, Rubrik, Beskrivning, Rå_OCR_text
+
+    Begränsningar:
+      - OCR_MAX_IMAGES (env, default 50)
+      - OCR_MAX_SECONDS (env, default 60 sek)
     """
+    # hur många bilder per körning?
+    max_images = int(os.getenv("OCR_MAX_IMAGES", "50"))
+    # max tillåten tid per körning
+    max_seconds = int(os.getenv("OCR_MAX_SECONDS", "60"))
+
+    start_time = time.time()
+
     wb = Workbook()
     ws = wb.active
     ws.title = "OCR_Ads"
@@ -256,12 +267,42 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
 
     valid_exts = {".png", ".jpg", ".jpeg", ".webp"}
 
+    count = 0
     for img_path in sorted(images_dir.iterdir()):
         if img_path.suffix.lower() not in valid_exts:
             continue
 
+        # stoppa om vi passerat tidsgräns
+        if time.time() - start_time > max_seconds:
+            ws.append([
+                "",
+                f"Avbröt OCR (tidsgräns {max_seconds}s nådd)",
+                "",
+                "",
+            ])
+            break
+
+        # stoppa om vi nått max_images
+        if count >= max_images:
+            ws.append([
+                "",
+                f"Avbröt OCR (max {max_images} bilder nådd)",
+                "",
+                "",
+            ])
+            break
+
+        count += 1
+
         try:
             img = Image.open(img_path)
+
+            # lite nerskalning för att snabba upp
+            try:
+                img.thumbnail((1200, 1200))
+            except Exception:
+                pass
+
             raw_text = pytesseract.image_to_string(img, lang="swe+eng")
         except Exception as e:
             safe_err = clean_excel_text(e)
@@ -288,6 +329,7 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     wb.save(out)
     out.seek(0)
     return out
+
 
 @app.get("/ocr_job/{job_id}")
 def ocr_job(job_id: str):
