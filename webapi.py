@@ -253,11 +253,8 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
       - OCR_MAX_IMAGES (env, default 50)
       - OCR_MAX_SECONDS (env, default 60 sek)
     """
-    # hur många bilder per körning?
     max_images = int(os.getenv("OCR_MAX_IMAGES", "50"))
-    # max tillåten tid per körning
     max_seconds = int(os.getenv("OCR_MAX_SECONDS", "60"))
-
     start_time = time.time()
 
     wb = Workbook()
@@ -297,7 +294,7 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
         try:
             img = Image.open(img_path)
 
-            # lite nerskalning för att snabba upp
+            # nerskalning för fart/minne
             try:
                 img.thumbnail((1200, 1200))
             except Exception:
@@ -329,6 +326,7 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     wb.save(out)
     out.seek(0)
     return out
+
 
 
 @app.get("/ocr_job/{job_id}")
