@@ -154,7 +154,7 @@ async def do_job(job_id: str, ar_input: str):
             write_status(job_dir, progress=5, message="Fångar nätverk…")
             await run_with_timeout(
                 capture_network(ar_input, run_dir=job_dir),
-                timeout_sec=12 * 60,
+                timeout_sec=12 * 600,
                 step_name="capture_network",
                 job_dir=job_dir,
             )
