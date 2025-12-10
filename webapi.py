@@ -242,20 +242,25 @@ def get_logs(job_id: str):
     return PlainTextResponse(p.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------
-# OCR på bilder i job_dir/images (batch + 14 min timeout)
+# OCR – batchar över flera anrop, med state per jobb
 # ---------------------------------------------------
-def ocr_images_in_dir(images_dir: Path) -> BytesIO:
+def ocr_images_batch(
+    image_paths,
+    start_index: int,
+    max_images: int,
+    max_seconds: int,
+):
     """
-    Kör OCR på ett begränsat antal bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
-    Kolumner: Bildfil, Rubrik, Beskrivning, Rå_OCR_text
+    Kör OCR på en batch av bilder:
 
-    Begränsningar styrs via env:
-      - OCR_MAX_IMAGES (default 200)
-      - OCR_MAX_SECONDS (default 840 sek = 14 min)
+    - image_paths: sorterad lista med Path-objekt
+    - start_index: index i listan att börja på
+    - max_images: max antal bilder i denna batch
+    - max_seconds: max tid för denna batch
+
+    Returnerar:
+      (excel_bytes, processed_count, new_index, reason_str)
     """
-    max_images = int(os.getenv("OCR_MAX_IMAGES", "200"))
-    max_seconds = int(os.getenv("OCR_MAX_SECONDS", "840"))  # 14 minuter
-
     start_time = time.time()
 
     wb = Workbook()
@@ -263,15 +268,23 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     ws.title = "OCR_Ads"
     ws.append(["Bildfil", "Rubrik", "Beskrivning", "Rå_OCR_text"])
 
+    total = len(image_paths)
     valid_exts = {".png", ".jpg", ".jpeg", ".webp"}
 
-    count = 0
-    for img_path in sorted(images_dir.iterdir()):
+    processed = 0
+    idx = start_index
+    reason = "completed"  # default, ändras vid break
+
+    # Loop max max_images eller tills listan tar slut
+    while idx < total and processed < max_images:
+        img_path = image_paths[idx]
         if img_path.suffix.lower() not in valid_exts:
+            idx += 1
             continue
 
-        # stoppa om vi passerat tidsgräns
+        # tidsgräns före tunga operationer
         if time.time() - start_time > max_seconds:
+            reason = "time_limit"
             ws.append([
                 "",
                 f"Avbröt OCR (tidsgräns {max_seconds}s nådd)",
@@ -279,18 +292,6 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
                 "",
             ])
             break
-
-        # stoppa om vi nått max_images
-        if count >= max_images:
-            ws.append([
-                "",
-                f"Avbröt OCR (max {max_images} bilder nådd)",
-                "",
-                "",
-            ])
-            break
-
-        count += 1
 
         try:
             img = Image.open(img_path)
@@ -305,10 +306,11 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
         except Exception as e:
             safe_err = clean_excel_text(e)
             ws.append([clean_excel_text(img_path.name), "OCR-fel", "", safe_err])
+            idx += 1
+            processed += 1
             continue
 
         text = clean_excel_text(raw_text)
-
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if lines:
             title = clean_excel_text(lines[0][:200])
@@ -323,35 +325,109 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
             text,
         ])
 
+        idx += 1
+        processed += 1
+
+    if processed >= max_images and idx < total:
+        reason = "image_limit"
+        ws.append([
+            "",
+            f"Avbröt OCR (max {max_images} bilder i denna batch)",
+            "",
+            "",
+        ])
+    elif idx >= total and reason == "completed":
+        # Alla bilder klara i denna batch
+        ws.append([
+            "",
+            "OCR klar för alla bilder i detta jobb.",
+            "",
+            "",
+        ])
+
     out = BytesIO()
     wb.save(out)
     out.seek(0)
-    return out
+    return out, processed, idx, reason
 
 @app.get("/ocr_job/{job_id}")
 def ocr_job(job_id: str):
     """
-    Kör OCR på alla (begränsat antal) bilder för ett befintligt jobb (job_dir/images)
-    och returnerar en ny Excel-fil med OCR-resultat.
+    Kör OCR i batchar för ett jobb. Håller reda på progress i ocr_state.json.
+
+    Varje anrop:
+      - tar nästa batch (OCR_MAX_IMAGES, default 30)
+      - respekterar tidsgräns OCR_MAX_SECONDS (default 840s)
+      - returnerar en Excel-fil med just denna batch
+      - uppdaterar ocr_state.json med nästa startindex
+
+    När alla bilder är klara returneras 400 med detail="ocr_already_completed".
     """
     job_dir = RUNS_DIR / job_id
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="unknown_job_id")
 
     images_dir = job_dir / "images"
-    if not images_dir.exists() or not any(images_dir.iterdir()):
+    if not images_dir.exists():
         raise HTTPException(status_code=404, detail="no_images_for_job")
 
+    image_paths = sorted(
+        [p for p in images_dir.iterdir() if p.is_file()]
+    )
+    if not image_paths:
+        raise HTTPException(status_code=404, detail="no_images_for_job")
+
+    max_images = int(os.getenv("OCR_MAX_IMAGES", "30"))
+    max_seconds = int(os.getenv("OCR_MAX_SECONDS", "840"))  # 14 min
+
+    state_path = job_dir / "ocr_state.json"
+    next_index = 0
+    state = {}
+
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            next_index = int(state.get("next_index", 0))
+        except Exception:
+            next_index = 0
+            state = {}
+
+    total = len(image_paths)
+
+    if next_index >= total:
+        # All OCR redan klar
+        raise HTTPException(status_code=400, detail="ocr_already_completed")
+
+    append_log(job_dir, f"OCR batch start: job_id={job_id}, start_index={next_index}, max_images={max_images}, max_seconds={max_seconds}")
+
     try:
-        excel_bytes = ocr_images_in_dir(images_dir)
+        excel_bytes, processed, new_index, reason = ocr_images_batch(
+            image_paths=image_paths,
+            start_index=next_index,
+            max_images=max_images,
+            max_seconds=max_seconds,
+        )
     except Exception as e:
+        append_log(job_dir, f"OCR ERROR: {e}")
         raise HTTPException(status_code=500, detail=f"OCR-fel: {e}")
 
-    filename = f"ads_ocr_{job_id}.xlsx"
+    # uppdatera state
+    new_state = {
+        "next_index": int(new_index),
+        "total_images": total,
+        "last_batch_processed": int(processed),
+        "last_reason": reason,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    write_json(state_path, new_state)
+
+    append_log(job_dir, f"OCR batch done: processed={processed}, new_index={new_index}, reason={reason}")
+
+    filename = f"ads_ocr_{job_id}_batch_{next_index}_to_{new_index-1}.xlsx"
     return Response(
         content=excel_bytes.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
     )
 
 # ---------------------------------------------------
@@ -458,12 +534,12 @@ WIDGET_HTML = """<!DOCTYPE html>
 
       <h4>Steg 2 (valfritt): OCR på annonsbilder</h4>
       <p style="margin-top:0;">
-        När scraping är klar kan du köra OCR på alla annonsbilder för att läsa ut rubriker
-        och beskrivningar direkt från bilderna.
+        När scraping är klar kan du köra OCR på annonsbilderna i batchar.
+        Varje klick på knappen kör nästa batch tills alla är klara.
       </p>
 
       <button id="ocrImagesBtn" type="button" disabled style="margin-right:8px;">
-        Kör OCR på annonsbilderna
+        Kör OCR på annonsbilderna (batch)
       </button>
       <span id="ocrImagesStatus" style="font-size:0.9rem;"></span>
     </div>
@@ -612,7 +688,7 @@ WIDGET_HTML = """<!DOCTYPE html>
           startStatus.textContent = "Jobb klart.";
           log("Jobb klart.");
           ocrBtn.disabled = false;
-          ocrStatus.textContent = "Scraping klar – du kan nu köra OCR på annonsbilderna.";
+          ocrStatus.textContent = "Scraping klar – du kan nu köra OCR på annonsbilderna i batchar.";
         } else if (data.status === "error") {
           clearInterval(pollTimer);
           pollTimer = null;
@@ -642,8 +718,8 @@ WIDGET_HTML = """<!DOCTYPE html>
       }
 
       ocrBtn.disabled = true;
-      ocrStatus.textContent = "Kör OCR på annonsbilderna...";
-      log("Startar OCR för jobb " + currentJobId);
+      ocrStatus.textContent = "Kör OCR på nästa batch...";
+      log("Startar OCR-batch för jobb " + currentJobId);
 
       try {
         const url = API_BASE + "/ocr_job/" + encodeURIComponent(currentJobId);
@@ -661,14 +737,14 @@ WIDGET_HTML = """<!DOCTYPE html>
         const dlUrl = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = dlUrl;
-        a.download = "ads_ocr_" + currentJobId + ".xlsx";
+        a.download = "ads_ocr_" + currentJobId + "_batch.xlsx";
         document.body.appendChild(a);
         a.click();
         a.remove();
         URL.revokeObjectURL(dlUrl);
 
-        ocrStatus.textContent = "OCR klar – fil nedladdad.";
-        log("OCR-fil nedladdad.");
+        ocrStatus.textContent = "OCR-batch klar – fil nedladdad. Kör igen för nästa batch om det finns fler bilder.";
+        log("OCR-batch-fil nedladdad.");
       } catch (err) {
         console.error(err);
         ocrStatus.textContent = "Tekniskt fel vid OCR: " + err;
