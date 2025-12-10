@@ -13,7 +13,7 @@ from fastapi.responses import (
 from pathlib import Path
 import os, json, uuid, asyncio, traceback, time
 from io import BytesIO
-import re  # <--- NYTT
+import re
 
 from openpyxl import Workbook
 from PIL import Image
@@ -129,7 +129,7 @@ def read_status(job_dir: Path):
         return None
 
 # ---------------------------------------------------
-# Job-körning
+# Job-körning (scraper)
 # ---------------------------------------------------
 OVERALL_DEADLINE_SEC = int(os.getenv("OVERALL_DEADLINE_SEC", "1200"))  # 20 min
 
@@ -154,12 +154,12 @@ async def do_job(job_id: str, ar_input: str):
             write_status(job_dir, progress=5, message="Fångar nätverk…")
             await run_with_timeout(
                 capture_network(ar_input, run_dir=job_dir),
-                timeout_sec=24 * 600,
+                timeout_sec=12 * 60,
                 step_name="capture_network",
                 job_dir=job_dir,
             )
 
-            # 2. Debug JSON
+            # 2. Debug JSON (valfritt)
             try:
                 cand_path = job_dir / "ads_candidates.json"
                 if cand_path.exists():
@@ -242,19 +242,20 @@ def get_logs(job_id: str):
     return PlainTextResponse(p.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------
-# OCR på bilder i job_dir/images
+# OCR på bilder i job_dir/images (batch + 14 min timeout)
 # ---------------------------------------------------
 def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     """
     Kör OCR på ett begränsat antal bildfiler i images_dir och returnerar ett Excel (bytes i minnet).
     Kolumner: Bildfil, Rubrik, Beskrivning, Rå_OCR_text
 
-    Begränsningar:
-      - OCR_MAX_IMAGES (env, default 50)
-      - OCR_MAX_SECONDS (env, default 60 sek)
+    Begränsningar styrs via env:
+      - OCR_MAX_IMAGES (default 200)
+      - OCR_MAX_SECONDS (default 840 sek = 14 min)
     """
-    max_images = int(os.getenv("OCR_MAX_IMAGES", "50"))
-    max_seconds = int(os.getenv("OCR_MAX_SECONDS", "60"))
+    max_images = int(os.getenv("OCR_MAX_IMAGES", "200"))
+    max_seconds = int(os.getenv("OCR_MAX_SECONDS", "840"))  # 14 minuter
+
     start_time = time.time()
 
     wb = Workbook()
@@ -327,12 +328,10 @@ def ocr_images_in_dir(images_dir: Path) -> BytesIO:
     out.seek(0)
     return out
 
-
-
 @app.get("/ocr_job/{job_id}")
 def ocr_job(job_id: str):
     """
-    Kör OCR på alla bilder för ett befintligt jobb (job_dir/images)
+    Kör OCR på alla (begränsat antal) bilder för ett befintligt jobb (job_dir/images)
     och returnerar en ny Excel-fil med OCR-resultat.
     """
     job_dir = RUNS_DIR / job_id
@@ -474,8 +473,8 @@ WIDGET_HTML = """<!DOCTYPE html>
 
   <script>
   (function() {
+    // Viktigt: peka alltid mot Render-API:t, inte Squarespace-domänen
     const API_BASE = "https://ads-fetcher.onrender.com";
-// byt ut mot exakt din Render-URL om den skiljer sig
 
     const arInput       = document.getElementById("arInput");
     const startBtn      = document.getElementById("startBtn");
